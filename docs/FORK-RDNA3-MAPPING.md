@@ -88,9 +88,9 @@ find; "in another form" names what is there instead.
 | fork switch / feature | kind | fork's own claim | status in v0.2.8 |
 |---|---|---|---|
 | `STRATA_SPEC_CUM` | decode | draft cumulative-probability floor (android-imdad/Strata-7900xtx, `02602e1`) | **in another form, and only for DFlash2**: `--draft-conf` gates the chain product in the `dflash2` drafter; the MTP window (`--mtp`, this box) has only `--spec-min-p`'s per-draft floor. **Ported for MTP in this fork** (`fork-accel`), see §2a |
-| `STRATA_COMBINE_CPU` | decode | the expert combine reads the CPU share's rows from the mapped buffer, fused with the GPU rows | absent. Upstream's closest is `STRATA_LFUSE` (S26: fewer launches around the shared expert and the KV append), which is a different fusion |
-| `STRATA_WAIT_FUSE` | decode | the CPU-share wait in every combine block | absent |
-| `STRATA_ROUTE_PUBLISH` | decode | top-10 route and doorbell publish in one launch | **in another form**: upstream's `doorbell_publish_res` publishes the resident plan's results (route included) in one call; the route itself is still its own `resident_plan` launch in both |
+| `STRATA_COMBINE_CPU` | decode | the expert combine reads the CPU share's rows from the mapped buffer, fused with the GPU rows | absent. Upstream's closest is `STRATA_LFUSE` (S26: fewer launches around the shared expert and the KV append), which is a different fusion. **Ported in this fork** (`STRATA_COMBINE_CPU`), see §2b |
+| `STRATA_WAIT_FUSE` | decode | the CPU-share wait in every combine block | **in another form**: upstream's 143-amdk `STRATA_FUSE_WAIT` folds the wait into the copy that follows it (`wait_copy_i32_from_mapped`, `copy_rows_from_mapped_after`). **Plan-only on HIP now too** (`STRATA_FUSE_WAIT=2`), which is what the fork's switch does; see §2b |
+| `STRATA_ROUTE_PUBLISH` | decode | top-10 route and doorbell publish in one launch | **in another form**: upstream's `doorbell_publish_res` publishes the resident plan's results (route included) in one call; the route itself is still its own `resident_plan` launch in both. **Ported in this fork** (`STRATA_ROUTE_PUBLISH`), see §2b |
 | `STRATA_RDNA_MMVQ_WAVE` | decode | gfx1100 wave count for the multi-column GEMV | absent. The gfx1100 GEMV table upstream has is the one this fork added in `gfx1100-mmvf-rows1` (rows per block), not a wave switch |
 | `STRATA_RDNA_Q6K` | decode | gfx1100 multi-column Q6_K x q8_1 GEMV (`rdna_mmvq.cu`) | absent: v0.2.8 has no `rdna_mmvq.cu`; Q6_K goes through `iq_kernels.cu`'s generic chain |
 | `STRATA_PREFILL_MMQ_TILE_ROWS` | prefill | tile rows for the prompt MMQ GEMM (`moe_mmq.cu`) | absent as a knob. `moe_fused_iq.cu` computes its tile rows at compile time (`tile_rows(ww, nt)`), a different kernel |
@@ -121,6 +121,47 @@ Two runs at 0.4 against two base runs: **+2.4% to +3.6% tok/s**, the same cost p
 0.6 cuts the windows too short - the highest acceptance of the four, and no throughput left. 0.4 is what the fork's
 `fork-accel` branch recommends; it stays opt-in (an env var, no CLI change).
 
+### 2b. `STRATA_ROUTE_PUBLISH` / `STRATA_COMBINE_CPU` / `STRATA_WAIT_FUSE`, ported
+
+The three decode-path fusions are in this fork, each behind its own env var and **each off by default**, so the
+default path is unchanged:
+
+| switch | what it replaces | launch saved per MoE layer |
+|---|---|---|
+| `STRATA_ROUTE_PUBLISH=1` | `native_router_top10_multi` + `doorbell_publish_res` / `doorbell_publish` | 1 |
+| `STRATA_COMBINE_CPU=1` | `wait_flag_ge` + `copy_rows_from_mapped` + `moe_hit_add` + the parts-array combine | 3 |
+| `STRATA_FUSE_WAIT=2` | the plan's `wait_flag_ge` + `copy_i32_from_mapped` (the fork's `STRATA_WAIT_FUSE`) | 1 |
+
+(`STRATA_FUSE_WAIT=1` is upstream's older, wider form: it folds the CPU-rows wait into
+`copy_rows_from_mapped_after` as well. On HIP `=2` used to mean `=1`; it now means the plan only, as on CUDA.)
+
+Ports: `route_row` split out of `route_multi` plus `route_publish_res` / `route_publish_all`
+(`native_router.cu`), and `combine_cpu_k10_vec4` / `native_moe_combine_multi_cpu` (`native_moe.cu`), wired in
+`verify.cpp` under the same guards the fork uses (`!ar_on() && !device_plan_ && !remote_opt_`, `k = 10`, 2-8 rows).
+Both are bitwise the launches they replace. The fork's remaining half of `COMBINE_CPU` - the shared expert's gate row
+riding in the router GEMV (`STRATA_MMVF_AUX`, an aux block in the *multi* BF16 kernel) - was **not** taken: it only
+pays off together with `STRATA_LFUSE`, which this box does not run.
+
+Measured on this box (oct3, production config and its 23 switches, engine 0.1.54, binary `40a61eaa`), 16-prompt
+harness, one run per arm, median over 16 prompts (`perf/raw/tps2-b-c*.txt`):
+
+| arm | tok/s | ms per forward | acceptance |
+|---|---|---|---|
+| control | 96.05 / 98.20 | 26.97 / 27.04 | 73.0% / 74.2% |
+| `ROUTE_PUBLISH=1` | 97.55 | 27.20 | 72.9% |
+| `COMBINE_CPU=1` | 97.85 | 27.10 | 72.9% |
+| `COMBINE_CPU=1 FUSE_WAIT=1` | 97.50 / 96.50 / 97.30 | 27.10 / 26.67 / 26.90 | 72.5% / 69.8% / 72.0% |
+| `FUSE_WAIT=1` (previous binary) | 96.75 | 27.23 | 72.9% |
+
+Run-to-run spread on this harness is ±1.5% (the two control runs differ by 2.2% by themselves), and the paired
+per-prompt comparison puts the three arms between -1.5% and +1.1% tok/s against the control, with ms per forward
+0.2-2.2% lower for `COMBINE_CPU`. **Nothing here clears the 2% gate**: three launches of a ~40-layer window are
+~0.3 ms of a 27 ms forward at best, and this host does not turn that into visible throughput. They stay in the tree
+opt-in and **off**; the production unit's environment is unchanged.
+
+Quality: greedy answers on the harness's three questions are character-identical with all three switches on and off,
+and the 16-prompt harness's acceptance is unchanged (72.9% against 73.0%), which is what a bitwise port should show.
+
 
 
 The fork's posted 32K prefill (3511 tok/s) and decode (100.6 tok/s) on a 7900 XTX with a Zen2 / PCIe 3 host (lcz.me
@@ -149,6 +190,10 @@ IQ3_S byte-plane kernel** (this box's `--pool-workers 15` makes the CPU share a 
 Do not port a switch without its measurement: the fork itself records `PREFILL_RAMP` as "measured no gain" and one
 `RDNA_IQ3S` kernel as "correct but slower than the native kernel at T >= 2", which is what a port looks like when the
 number was taken before the code was kept.
+
+Status: `SPEC_CUM` (§2a) and the three decode fusions (§2b) are ported and measured; the fusions did not clear the
+gate and stay off, `SPEC_CUM=0.4` is deployed. The CPU IQ3_S byte-plane kernel, `PA_KLDS` /
+`PREFILL_MMQ_TILE_ROWS`, `RDNA_MMVQ_WAVE` / `RDNA_Q6K` and the `GR_*` group are still to do, in that order.
 
 ## 4. What we did not take, and why
 

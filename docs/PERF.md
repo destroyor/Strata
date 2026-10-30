@@ -91,6 +91,23 @@ yardstick.
 enough that the gain is gone. The floor only chooses which drafts are verified; the sample is unchanged, so no KL run
 is needed for it (unlike the prefill switches above).
 
+## The RDNA3 fork's decode fusions (`ROUTE_PUBLISH` / `COMBINE_CPU` / `WAIT_FUSE`), opt-in and off
+
+Three launches per MoE layer folded away, all bitwise (`docs/FORK-RDNA3-MAPPING.md` §2b). 16-prompt harness,
+production config and its 23 switches, engine 0.1.54, binary `40a61eaa`, `perf/raw/tps2-b-c*.txt`:
+
+| arm | tok/s | ms/fwd | acceptance |
+|---|---|---|---|
+| control | 96.05 / 98.20 | 26.97 / 27.04 | 73.0% / 74.2% |
+| `ROUTE_PUBLISH=1` | 97.55 | 27.20 | 72.9% |
+| `COMBINE_CPU=1` | 97.85 | 27.10 | 72.9% |
+| `COMBINE_CPU=1 FUSE_WAIT=1` | 97.50 / 96.50 / 97.30 | 27.10 / 26.67 / 26.90 | 72.5% / 69.8% / 72.0% |
+
+The harness repeats within ±1.5% (the two control runs differ by 2.2%), and a paired per-prompt comparison puts the
+arms between -1.5% and +1.1% of the control. The fusions are real (ms per forward is 0.2-2.2% lower for
+`COMBINE_CPU`) but too small for this host to show as throughput, so they are not deployed. Greedy answers are
+character-identical on and off.
+
 ## On the v0.2.8 port (engine 0.1.54)
 
 The same config on both engines (`--kv-resident 32768`, `--prefill auto:8192`), only `--kv` and the binary differ,

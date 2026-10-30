@@ -50,3 +50,12 @@ spec5cum50	160000	93.95	29.04	70.4	strata-sc117-iq3_s.json	SPEC_CUM=0.5
 spec6	160000	88.70	38.67	61.9	ab/cfg-spec6.json	SPEC_CUM=0.4
 spec4	160000	95.50	27.41	70.7	ab/cfg-spec4.json	SPEC_CUM=0.4
 spec4cum50	160000	95.30	26.98	74.2	ab/cfg-spec4.json	SPEC_CUM=0.5
+bfuse-wf0	160000	94.90	27.41	71.3	strata-sc117-iq3_s.json	prod (23 switches)
+bfuse-wf1	160000	96.75	27.23	72.9	strata-sc117-iq3_s.json	prod + FUSE_WAIT=1 (0.1.49.2 binary)
+bfuse-c0	160000	96.05	26.97	73.0	strata-sc117-iq3_s.json	prod (40a61eaa)
+bfuse-c0c	160000	98.20	27.04	74.2	strata-sc117-iq3_s.json	prod (40a61eaa)
+bfuse-c1	160000	97.55	27.20	72.9	strata-sc117-iq3_s.json	prod + ROUTE_PUBLISH=1
+bfuse-c2	160000	97.85	27.10	72.9	strata-sc117-iq3_s.json	prod + COMBINE_CPU=1
+bfuse-c3	160000	97.50	27.10	72.5	strata-sc117-iq3_s.json	prod + COMBINE_CPU=1 FUSE_WAIT=1
+bfuse-c3b	160000	96.50	26.67	69.8	strata-sc117-iq3_s.json	prod + COMBINE_CPU=1 FUSE_WAIT=1
+bfuse-c3c	160000	97.30	26.90	72.0	strata-sc117-iq3_s.json	prod + COMBINE_CPU=1 FUSE_WAIT=1

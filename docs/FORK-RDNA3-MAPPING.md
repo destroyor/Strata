@@ -235,38 +235,40 @@ more expensive.
 at `--spec-min-p 0` our drafter already takes its one-graph path, and that arm is 3% *slower* than 0.5 - the extra
 draft steps cost more than the host round trips they would save.
 
-### 2f. The reference engine built here: 121 tok/s, and it is not the switches
+### 2f. The reference engine built here: 121 tok/s, and it is the combine fusions
 
 The fork's tree was built on this box (0.1.43, `fc8f823`, ROCm 10.2, gfx1100) and run against *this* model and *this*
-harness's documents (`ab/tg_fork.sh`, `ab/tg_sweep.py --port 8090`), 256 tokens, one fresh document per size:
+harness's documents (`ab/tg_fork.sh`, `ab/tg_sweep.py --port 8090`), 256 tokens, one fresh document per size. Upstream
+`v0.1.43` (this repo's tag) was built too, and that same config was run against it:
 
-| arm (their engine, our box and text) | 32K TG | ms/fwd | 64K TG | ms/fwd |
+| engine, same model / text / config | 32K TG | ms/fwd | 64K TG | ms/fwd |
 |---|---|---|---|---|
-| their preset (42 switches, `--kv int8`) | **121.6** | 21.26 | **119.0** | 20.89 |
-| minus the `GR_*` group | 125.0 | 20.69 | 117.3 | 21.19 |
-| minus `RDNA_MMVQ_WAVE` / `RDNA_Q6K` | 119.3 | 21.03 | 117.1 | 21.03 |
-| minus the `PF_*` / `PA_KLDS` / tile-rows group | 125.0 | 20.90 | 114.7 | 21.46 |
-| `--kv oct3 --kv-resident 65536` (our format) | 124.8 | 21.37 | 117.0 | 21.03 |
-| ours (0.1.54 + `RDNA_Q6K`), same protocol | ~93 | ~27 | ~84 | ~27 |
+| fork, their preset (42 switches) | **121.6** | 21.26 | **119.0** | 20.89 |
+| fork, minus the `GR_*` group | 125.0 | 20.69 | 117.3 | 21.19 |
+| fork, minus `RDNA_MMVQ_WAVE` / `RDNA_Q6K` | 119.3 | 21.03 | 117.1 | 21.03 |
+| fork, minus `PF_*` / `PA_KLDS` / tile rows | 125.0 | 20.90 | 114.7 | 21.46 |
+| fork, `--kv oct3 --kv-resident 65536` (our format) | 124.8 | 21.37 | 117.0 | 21.03 |
+| **fork, no `COMBINE_CPU` / `WAIT_FUSE` / `ROUTE_PUBLISH`** | **92.6** | **28.50** | **93.1** | **28.35** |
+| fork, no env at all | 94.5 | 27.64 | 90.9 | 27.88 |
+| upstream `v0.1.43`, same args, 7 switches | 92.5 | 27.95 | 92.9 | 28.13 |
+| ours (0.1.54 + `RDNA_Q6K`) | ~93 | ~27.5 | ~84 | ~27.5 |
 
-So their 106 on a 6-core Zen2 is 119-125 on this 16-core host, and **none of their switch groups explains it**: every
-subset above lands within noise of the full preset, and the KV format does not matter either. The difference is
-0.1.43 against 0.1.54 for this model - 21.0 ms against 27.5 ms per forward at the same window width and the same
-draft acceptance.
+So the whole 25% is **`COMBINE_CPU` + `WAIT_FUSE` + `ROUTE_PUBLISH`**: every other group and the KV format are inside
+noise, upstream 0.1.43 without them is at 27.9 ms (the same as our 0.1.54), and the fork with them is at 21.0. That is
+the fork's decode win, and it is the group ported in §2b.
 
-Two candidate explanations that are **ruled out by measurement**:
+**On our engine the same three switches measure 0.0 ms** (26.5 with, 26.4-26.8 without; 240 fewer graph nodes and no
+change in wall time, with and without `STRATA_ADAPT_OVERLAP`). So the launch savings are not what their engine gains:
+theirs must be the 27 MB per forward of CPU-row copies `copy_rows_from_mapped` makes (2.7 rows x 10 experts x 48
+layers x 20 KB, over mapped host memory), which their unfused path pays and ours apparently does not - our deployed
+decode hit rate is 94-96%, and the copies are already off the critical path here. The remaining 5.5 ms between our
+fused window (26.5) and theirs (21.0) needs a per-kernel profile (rocprof-sys is on the box) rather than more
+ablation: it is *not* launch count, the CPU share's throughput (4 workers cost 4%), or the graph's node count.
 
-- *Launch count.* Their 6-token window graph has 1192 nodes, ours 1829. Our three B-class fusions (§2b) remove 240
-  of them and 0.0 ms; their own `GR_*` group fuses 6 launches per layer into 2 and 0.0 ms. Graph nodes overlap with
-  execution here; the window is not launch-bound.
-- *The CPU expert share.* 4 pool workers instead of 15 cost 4% (§2d), so the host is not on the critical path.
-
-What is left is the decode work itself between `v0.1.43` and `v0.1.54` (this repo carries both tags): the window
-captures roughly twice as many `native_down_multi` / `swiglu_q8_1_entries` / `native_mmvq_multi` nodes per layer as
-the fork's, and some of that is real work, not just launches. Bisecting that range with this harness (32K, one
-document, engine timings) is the next step to reach the fork's number on our engine.
-
-
+One piece of their `COMBINE_CPU` is still unported on our side: `STRATA_MMVF_AUX`, the shared expert's gate row riding
+in the *multi-row* BF16 router GEMV with the gate applied inside the combine (`native_bf16.cu`'s multi kernel takes
+the aux block there, ours only supports it in the rows kernel). It is one 2560-row matvec and a 2560-element sigmoid
+per layer - unlikely to be the 5.5 ms, but it is the only code left in that group that they run and we do not.
 
 The fork's posted 32K prefill (3511 tok/s) and decode (100.6 tok/s) on a 7900 XTX with a Zen2 / PCIe 3 host (lcz.me
 topic 2671) also depend on the WMMA prompt attention and QSA selection. This repo's CMake probes **rocWMMA** and

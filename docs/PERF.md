@@ -125,12 +125,15 @@ shared expert's gate/up), which is what it targets. 16-prompt harness, productio
 ### Where the fork's 106 tok/s really comes from
 
 Their tree built and run on this box, this model and the same documents: **121.6 / 119.0 tok/s at 32K / 64K**
-(21.0-21.3 ms per forward), against our ~93 / ~84 (~27.5 ms). No switch group of theirs accounts for it (GR group
-off, RDNA group off, PF/PA group off: all inside noise) and neither does the KV format (`--kv oct3` on their engine
-is the same). It is 0.1.43 against 0.1.54: 1192 window-graph nodes against 1829, and roughly twice the
-`native_down_multi` / `swiglu_q8_1_entries` / `native_mmvq_multi` work per layer. Launch count is ruled out - our
-B-class fusions remove 240 nodes and 0.0 ms - and so is the CPU share (4 pool workers cost 4%). The number to beat on
-this hardware is 121, not 106. Details in `docs/FORK-RDNA3-MAPPING.md` §2f.
+(21.0-21.3 ms per forward), against our ~93 / ~84 (~27.5 ms). Ablation says all of it is one group: with
+`COMBINE_CPU` + `WAIT_FUSE` + `ROUTE_PUBLISH` removed their engine falls to 92.6 / 93.1 (28.4-28.5 ms), which is what
+upstream v0.1.43 without them measures too (27.95 ms) - and what ours measures. The GR group, the RDNA group, the
+PF/PA group and the KV format are all inside noise on their engine.
+
+On ours the same three switches are worth 0.0 ms (26.5 against 26.4-26.8 ms, 240 fewer graph nodes, with and without
+`STRATA_ADAPT_OVERLAP`), so their win is not the launches: it is the 27 MB of CPU-row copies per forward that their
+unfused path pays over mapped host memory, which our window does not. The remaining 5.5 ms needs a per-kernel
+profile; details and the one unported piece (`STRATA_MMVF_AUX`) are in `docs/FORK-RDNA3-MAPPING.md` §2f.
 
 ## On the v0.2.8 port (engine 0.1.54)
 

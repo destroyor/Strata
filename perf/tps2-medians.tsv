@@ -84,3 +84,6 @@ minp30	160000	98.90	26.76	68.0	ab/cfg-minp30.json	prod + RDNA_Q6K, spec-min-p 0.
 nosfx	160000	94.75	26.76	72.4	ab/cfg-nosfx.json	prod + RDNA_Q6K, suffix-draft 0
 rtl-fuse	160000	102.50	26.53	74.7	strata-sc117-iq3_s.json	prod + RDNA_Q6K + COMBINE_CPU FUSE_WAIT ROUTE_PUBLISH
 rtl-ctl	160000	96.85	26.42	70.8	strata-sc117-iq3_s.json	prod + RDNA_Q6K
+ref-fuse-off	32768	92.60	28.50	69.1	fork 0.1.43	no COMBINE_CPU/WAIT_FUSE/ROUTE_PUBLISH
+ref-noenv	32768	94.50	27.64	71.2	fork 0.1.43	no env
+u143-upstream	32768	92.50	27.95	68.9	upstream v0.1.43	7 switches

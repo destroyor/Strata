@@ -92,3 +92,4 @@ grrdna-20261031	160000	107.25	25.68	73.8	strata-sc117-iq3_s.json	prod + RDNA_Q6K
 p2med-20261031	160000	105.65	25.20	71.9	strata-sc117-iq3_s.json	prod + RDNA_Q6K + GR_RDNA + PLE direct (deployed)
 c3med-20261031	160000	100.25	24.43	66.0	strata-sc117-iq3_s.json	+ mtp-window 4096: 1 ms cheaper, 6 acceptance points gone
 c60-20261031	160000	100.85	24.25	75.6	strata-sc117-iq3_s.json	+ SPEC_CUM 0.6: fewer tokens per window, net loss
+deployed-med-20261031	160000	103.30	24.46	70.8	(deployed unit, port 8089)	prod + RDNA_Q6K + GR_RDNA + PLE direct, measured through the service

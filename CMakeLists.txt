@@ -489,6 +489,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/kv_q8.cu
                           src/kernels/cuda/kv_stream.cu
                           src/kernels/cuda/kv_q4.cu
+                          src/kernels/cuda/kv_octave.cu
+                          src/kernels/cuda/kv_exact_window.cu
                           src/kernels/cuda/fused_gr.cu
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
@@ -2476,6 +2478,16 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(q8_gemv_bench src/kernels/q8_gemv_bench.cpp)
     target_include_directories(q8_gemv_bench PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(q8_gemv_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    # 3-bit Lloyd-Max KV (the Octave KV structure): device bytes against the host reference bit for bit, plus the
+    # error on rotated vectors next to a 4-bit grid's. Registered here, not under STRATA_BUILD_TESTS, so the
+    # default (tests-off) build can run it; move it to the test block when the format lands.
+    add_executable(kv_octave_parity src/kernels/kv_octave_parity.cpp)
+    target_include_directories(kv_octave_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(kv_octave_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    # the exact fp16 window over a compressed layer (sinks + ring): eviction order, hits, exact values
+    add_executable(kv_exact_window_parity src/kernels/kv_exact_window_parity.cpp)
+    target_include_directories(kv_exact_window_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(kv_exact_window_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     if(STRATA_ENABLE_CUDA)
       # EXPDEC (docs/EXPERTDEC.md): the grouped experts' default kernels against STRATA_EXPDEC=1 at T = 1..4, bit for bit
       # and in microseconds, on synthetic blobs read cold from DRAM

@@ -67,6 +67,7 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_octave.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
@@ -909,6 +910,10 @@ void usage() {
                  "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
                  "                       (vs int8's 1,056); streams with --kv-resident too\n"
+                 "  --kv oct3            3-bit Lloyd-Max codes, 448 B/cell (55%% of k8v4, 78%% of q4_0), with an\n"
+                 "                       fp16 window (4 sinks + 1024 tail cells per layer by default, STRATA_KV_WINDOW,\n"
+                 "                       STRATA_KV_WINDOW_SINKS/TAIL). Experimental; gather path only (no fused decode\n"
+                 "                       kernel). Measured on gfx1100: docs/OCT3.md\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
@@ -1553,6 +1558,7 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
                      "smaller --max-context, or 'Prefer No Sysmem Fallback' for the engine in the NVIDIA control panel "
                      "(docs/DETAILS.md) leaves room");
     }
+    std::fprintf(f, "  prefill kv phase: %s\n", strata::prefill::kv_phase_text());
     for (int pass = 0; pass < 2; ++pass) {
         if (pass == 1) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -3726,19 +3732,33 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (o.kv == "q4") o.kv = "q4_0";
-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
-        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0 or k8v4\n");
+    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4" && o.kv != "oct3") {
+        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0, k8v4 or oct3\n");
         return 2;
     }
     strata::core::qsa_set_kv_int8(o.kv == "int8");
-    strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
+    // STRATA_KV_OCT=1: 3-bit Lloyd-Max K/V (kv_octave.hpp), 448 B per cell, reads through the gather path (there is
+    // no fused decode-attention variant yet). The fp16 exact window (4 sinks + 1024 tail cells per layer) is on by
+    // default; STRATA_KV_WINDOW=0 turns it off, STRATA_KV_WINDOW_SINKS/TAIL size it.
+    const char* kv_oct_env = std::getenv("STRATA_KV_OCT");
+    const bool kv_oct_env_on = kv_oct_env != nullptr && kv_oct_env[0] == '1';
+    const bool kv_oct_on = o.kv == "oct3" || kv_oct_env_on;
+    strata::core::qsa_set_kv_oct(kv_oct_on);
+    if (kv_oct_on) {
+        int ws = 0, wt = 0;
+        strata::core::qsa_window_sizes(ws, wt);
+        std::fprintf(stderr, "strata generate: %s: 3-bit Lloyd-Max K/V (448 B/cell, gather path; an fp16 window of %d "
+                             "sinks + %d tail cells per layer)\n",
+                     o.kv == "oct3" ? "--kv oct3" : "STRATA_KV_OCT=1", ws, wt);
+    }
+    strata::core::qsa_set_kv_q4(o.kv == "q4_0" && !kv_oct_on);   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
     // STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation --kv q4_0 already uses. Opt-in: first-token KL to
     // fp16 K/V improved on an NVFP4 pack (0.0066 -> 0.0051) but not on IQ2_XS (0.0022 -> 0.0054)
     const char* kv_rot = std::getenv("STRATA_KV_ROT");
     strata::core::qsa_set_kv_int8_rotate(kv_rot != nullptr && kv_rot[0] == '1');
     if (kv_rot != nullptr && kv_rot[0] == '1' && o.kv == "int8")
         std::fprintf(stderr, "strata generate: STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation (opt-in)\n");
-    strata::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
+    strata::core::qsa_set_kv_hybrid(o.kv == "k8v4" && !kv_oct_on);   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
     if (o.kv_resident < 0) {
         std::fprintf(stderr, "strata generate: --kv-resident must be >= 0\n");
         return 2;
@@ -5901,6 +5921,17 @@ int main(int argc, char** argv) {
                                  "%.2f GiB of pinned RAM\n",
                          (long long) (ss.qsa_states[ss.qsa_primary()].n_slots * 4),
                          (long long) o.max_context, (double) strata::core::qsa_kv_host_bytes() / 1073741824.0);
+        {   // --kv oct3: the exact window this session actually sized (kv_exact_window.hpp), so the log says whether
+            // the recent cells are served in fp16 or only as 3-bit codes
+            int ws = 0, wt = 0;
+            strata::core::qsa_window_sizes(ws, wt);
+            if (ws + wt > 0)
+                std::fprintf(stderr, "strata generate: KV window: the first %d and the newest %d cells of every QSA layer "
+                                     "in fp16 (%.1f MiB over %d layers)\n", ws, wt,
+                             (double) strata::kernels::kv_exact_window_bytes_per_layer(
+                                 strata::core::qsa_shapes(g), ws, wt) * (double) g.n_qsa_layers() / 1048576.0,
+                             (int) g.n_qsa_layers());
+        }
         // the PLE block above built everything but the history, which session_init has just carved
         ss.ple.hist = ss.ple_hist;
         // (#167) generate mode starts from an empty sequence, and nothing else zeroes this state before the prompt
@@ -10414,6 +10445,7 @@ int main(int argc, char** argv) {
                 c.backend = "cuda";
 #endif
                 c.kv = o.kv;
+                if (const char* oct = std::getenv("STRATA_KV_OCT"); oct != nullptr && oct[0] == 49) c.kv += "+oct3";
                 c.max_context = o.max_context;
                 c.kv_resident = o.kv_resident;
                 c.mtp_window = o.mtp.empty() ? -1 : o.mtp_window;
@@ -17020,7 +17052,10 @@ int main(int argc, char** argv) {
                 auto kv_arrays = [&](const strata::core::QsaState& st) {
                     const bool h = st.kv_mode != 0;
                     std::vector<std::pair<const void*, int64_t>> a;
-                    if (st.kv_q4) {
+                    if (st.kv_oct) {
+                        const int64_t ob = (int64_t) strata::kernels::kv_oct_bytes_per_head((int) qs.head_dim);
+                        a = {{h ? st.host.k_q4 : st.k_q4, ob}, {h ? st.host.v_q4 : st.v_q4, ob}};
+                    } else if (st.kv_q4) {
                         const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                         a = {{h ? st.host.k_q4 : st.k_q4, q4b}, {h ? st.host.v_q4 : st.v_q4, q4b}};
                     } else if (st.kv_hybrid) {

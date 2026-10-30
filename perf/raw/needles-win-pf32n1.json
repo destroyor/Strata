@@ -1,0 +1,16 @@
+[
+ {
+  "length": "96k",
+  "depth": 50,
+  "prompt_tokens": 94805,
+  "seconds": 37.6,
+  "found": false,
+  "word": "meadow-copper-504",
+  "answer": ""
+ },
+ {
+  "length": "128k",
+  "depth": 50,
+  "error": "[Errno 104] Connection reset by peer"
+ }
+]

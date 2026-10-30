@@ -1,0 +1,19 @@
+prefill+first: 23.6 s (160810 chars)
+  Summarise section 3 of this    rep0   88.9 tok/s   32.07 ms/fwd  acc  61.7%  prompt_n 7
+  Summarise section 3 of this    rep1   83.3 tok/s   30.40 ms/fwd  acc  57.6%  prompt_n 7
+  Summarise section 3 of this    rep2   83.5 tok/s   30.82 ms/fwd  acc  54.8%  prompt_n 7
+  List the three claims about    rep0  103.3 tok/s   31.51 ms/fwd  acc  68.9%  prompt_n 14670
+  List the three claims about    rep1  101.5 tok/s   34.04 ms/fwd  acc  66.5%  prompt_n 7
+  List the three claims about    rep2  101.5 tok/s   30.87 ms/fwd  acc  64.9%  prompt_n 7
+  What does the text say about   rep0  111.9 tok/s   33.12 ms/fwd  acc  71.9%  prompt_n 14670
+  What does the text say about   rep1  104.0 tok/s   31.89 ms/fwd  acc  64.7%  prompt_n 7
+  What does the text say about   rep2  123.4 tok/s   31.90 ms/fwd  acc  78.3%  prompt_n 7
+  Explain the verification win   rep0   77.0 tok/s   28.98 ms/fwd  acc  48.8%  prompt_n 14670
+  Explain the verification win   rep1   80.1 tok/s   28.52 ms/fwd  acc  50.5%  prompt_n 7
+  Explain the verification win   rep2   80.7 tok/s   27.99 ms/fwd  acc  49.8%  prompt_n 7
+  Which sentence is the most t   rep0   85.5 tok/s   29.58 ms/fwd  acc  61.0%  prompt_n 14670
+  Which sentence is the most t   rep1   89.7 tok/s   28.57 ms/fwd  acc  61.0%  prompt_n 7
+  Which sentence is the most t   rep2   90.5 tok/s   27.95 ms/fwd  acc  61.5%  prompt_n 7
+  Continue with more technical   rep0   79.1 tok/s   26.37 ms/fwd  acc  64.1%  prompt_n 14669
+  Continue with more technical   rep1   74.3 tok/s   25.09 ms/fwd  acc  54.9%  prompt_n 7
+  Continue with more technical   rep2   84.9 tok/s   29.46 ms/fwd  acc  57.1%  prompt_n 7

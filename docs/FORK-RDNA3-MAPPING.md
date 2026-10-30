@@ -356,6 +356,8 @@ running without §2c's +3.5% since it was "deployed". It is now in `[Service]`, 
 | `--mtp-q4 all` | 26.46 (vs 26.39) | 74.0% | no gain: the draft is not weight-read bound |
 | `STRATA_HC_Q8=1` (int8 hc weights, the existing S23 path) | 25.21 (vs 27.47) | 65.6% (vs 73.2%) | 2.3 ms cheaper (the read is bandwidth-bound: bf16 317 MB/window at 570 GB/s) but 7.6 acceptance points lost - net loss. An int8 `GR_RDNA` read would need a precision fix first |
 | `STRATA_VERIFY_PROFILE=1` | +0.5-2 ms | | the profiler's own cost (the fork's costs 2.4x: 121.6 -> 44.5 tok/s) |
+| `STRATA_HC_REQ8=1` (the other int8 hc route: quantized at load, both reads) | 58.53 (vs 25.94) | 68.7% | 2.3x slower: the prompt path and the single-token reader dequantize the int8 rows into a scratch on every call, so the read is paid 2x plus a dequant per layer |
+| `STRATA_NO_IQ512X1=1` (turns off the AVX512 one-token CPU expert kernel) | 26.09 (vs 25.94) | 73.5% | +0.15 ms only: the CPU share is hidden behind the GPU, so the fork's CPU IQ3_S byte-plane kernel has at most ~0.5% to give on this box - not worth the port (the engine already runs IQ3_S on AVX512) |
 
 Status: `SPEC_CUM` (§2a), the three decode fusions (§2b), the K-quant GEMV (§2c) and the `GR_*` read (§2h) are ported
 and measured; the fusions did not clear the gate and stay off, `SPEC_CUM=0.4`, `STRATA_RDNA_Q6K=1` and

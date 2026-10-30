@@ -1,0 +1,2233 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 989f5cdb..241d5871 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -412,6 +412,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+                           src/kernels/cuda/kv_q8.cu
+                           src/kernels/cuda/kv_stream.cu
+                           src/kernels/cuda/kv_q4.cu
++                          src/kernels/cuda/kv_octave.cu
++                          src/kernels/cuda/kv_exact_window.cu
+                           src/kernels/cuda/fused_gr.cu
+                           src/kernels/cuda/cvec.cu
+                           src/kernels/cuda/qsa_decode_attn.cu
+@@ -2143,6 +2145,16 @@ if(STRATA_NATIVE_EXPERTS)
+     add_executable(q8_gemv_bench src/kernels/q8_gemv_bench.cpp)
+     target_include_directories(q8_gemv_bench PRIVATE ${_strata_gpu_include_directories})
+     target_link_libraries(q8_gemv_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
++    # 3-bit Lloyd-Max KV (the Octave KV structure): device bytes against the host reference bit for bit, plus the
++    # error on rotated vectors next to a 4-bit grid's. Registered here, not under STRATA_BUILD_TESTS, so the
++    # default (tests-off) build can run it; move it to the test block when the format lands.
++    add_executable(kv_octave_parity src/kernels/kv_octave_parity.cpp)
++    target_include_directories(kv_octave_parity PRIVATE ${_strata_gpu_include_directories})
++    target_link_libraries(kv_octave_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
++    # the exact fp16 window over a compressed layer (sinks + ring): eviction order, hits, exact values
++    add_executable(kv_exact_window_parity src/kernels/kv_exact_window_parity.cpp)
++    target_include_directories(kv_exact_window_parity PRIVATE ${_strata_gpu_include_directories})
++    target_link_libraries(kv_exact_window_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+     if(STRATA_ENABLE_CUDA)
+       # EXPDEC (docs/EXPERTDEC.md): the grouped experts' default kernels against STRATA_EXPDEC=1 at T = 1..4, bit for bit
+       # and in microseconds, on synthetic blobs read cold from DRAM
+diff --git a/include/strata/core/layer.hpp b/include/strata/core/layer.hpp
+index 9e0361ac..4484c370 100644
+--- a/include/strata/core/layer.hpp
++++ b/include/strata/core/layer.hpp
+@@ -36,6 +36,7 @@
+ #include "strata/core/weights.hpp"
+ 
+ #include "strata/kernels/gr.hpp"
++#include "strata/kernels/kv_exact_window.hpp"
+ #include "strata/kernels/kv_stream.hpp"
+ #include "strata/kernels/ngram.hpp"
+ #include "strata/kernels/ple.hpp"
+@@ -223,6 +224,13 @@ struct QsaState {
+     /// Uses k_q/k_scale + v_q4. Mode 0 only (no KV streaming, no ring); under this setting the MTP drafter's
+     /// ring state stays plain INT8, so the block movers never see the hybrid layout.
+     bool kv_hybrid = false;
++    /// 3-bit Lloyd-Max K and V after the same Hadamard rotation (kv_octave.hpp): 448 B per cell, the format the
++    /// exact window is meant for. Reads through the gather path (no fused decode-attention variant yet).
++    bool kv_oct = false;
++    /// THE EXACT WINDOW (`--kv oct3`): the first `sinks` and the newest `tail` cells of this layer kept in fp16 as
++    /// well (kv_exact_window.hpp), so the tokens that carry most of the attention mass are never read from 3-bit
++    /// codes.  One layer per state, so the kernels always read it as layer 0.  Empty unless `kv_oct` is on.
++    strata::kernels::KvExactWindow win;
+     /// K and V go through kv_q4.hpp's Walsh-Hadamard rotation before they are stored, the queries too, the output
+     /// back: always for Q4_0, for INT8 by qsa_set_kv_int8_rotate (spreads outlier channels over the scale groups)
+     bool kv_rot = false;
+@@ -315,11 +323,18 @@ bool qsa_kv_int8();
+ /// PR #21: store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
+ void qsa_set_kv_q4(bool enabled);
+ bool qsa_kv_q4();
++/// 3-bit Lloyd-Max K/V (kv_octave.hpp): set before sizing and initializing the session.
++void qsa_set_kv_oct(bool enabled);
++bool qsa_kv_oct();
++/// The exact window (`--kv oct3`) as it is actually sized for one QSA layer: `sinks` and `tail` cell counts, both 0
++/// when the window is off (STRATA_KV_WINDOW=0, another KV format, or a draft ring).  For the startup log.
++void qsa_window_sizes(int& sinks, int& tail);
+ /// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell; streams with --kv-resident too.
+ void qsa_set_kv_hybrid(bool enabled);
+ bool qsa_kv_hybrid();
+ /// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4 / kKvHybrid).
+ inline int qsa_kv_format(const QsaState& st) {
++    if (st.kv_oct) return strata::kernels::kKvOct3;        // two byte runs, 14-byte blocks (kv_stream.cu)
+     if (st.kv_hybrid) return strata::kernels::kKvHybrid;   // K8V4: its own three runs (kv_stream.cu)
+     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
+ }
+@@ -332,6 +347,9 @@ void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* i
+ /// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
+ /// matters even for cells that are never attended, because `kv_gather` reads whatever the selection names.
+ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
++/// Marks every exact-window row empty, so no reader is served a value the sequence it now holds never wrote.  A
++/// restored (parked) or copied state's K/V may be another sequence's; its window must not answer for it.
++void qsa_window_invalidate(const QsaState& st, void* stream);
+ 
+ // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
+ //
+diff --git a/include/strata/kernels/kv_exact_window.hpp b/include/strata/kernels/kv_exact_window.hpp
+new file mode 100644
+index 00000000..ec25d4ff
+--- /dev/null
++++ b/include/strata/kernels/kv_exact_window.hpp
+@@ -0,0 +1,73 @@
++// include/strata/kernels/kv_exact_window.hpp - the exact window over a compressed KV layer: the first `sinks` cells and
++// the last `tail` cells of every layer are also kept in fp16, so the tokens that carry most of the attention mass
++// are never read from the quantized pool. The attention kernel does not change: it already reads a gathered fp16
++// scratch, so a window position is simply gathered from here instead of from the codes.
++//
++// WHY THIS EXISTS. A 3-bit KV cache is 4.5x the reconstruction error of 4-bit on the same vectors (measured:
++// kv_octave_parity, MSE 0.0508 vs 0.0114 rotated). vLLM's Octave KV reports the same arithmetic on this exact
++// model - Qwen3.8-Flash-Next costs +0.0395 nats at 3 bits, and +0.0163 with an fp16 window over the first 4 and
++// last 64 tokens - because with sparse attention a few recent tokens carry 35-80% of the mass, and their error
++// does not average out. The window is what makes the format usable, not an extra.
++//
++// LAYOUT. One pool per layer: `sinks` rows written once at positions 0..sinks-1, then a ring of `tail` rows for
++// the newest positions. A row is [n_head_kv][head_dim] fp16 for K and for V. A per-row tag holds the position it
++// currently holds (or -1), so a gather of a position older than the window reports itself as a miss instead of
++// returning another token's keys.
++#pragma once
++
++#include "strata/kernels/qsa.hpp"
++
++#include "strata/kernels/f16_bits.hpp"   // STRATA_HD
++
++#include <cstdint>
++
++namespace strata::kernels {
++
++struct KvExactWindow {
++    uint16_t* k = nullptr;      ///< [layers][sinks + tail][n_head_kv * head_dim]
++    uint16_t* v = nullptr;      ///< same
++    int32_t* tag = nullptr;     ///< [layers][sinks + tail] the position the row holds, or -1
++    int layers = 0, sinks = 0, tail = 0, n_head_kv = 0, head_dim = 0, pos_stride = 0;   // pos_stride = [kStepPos]
++
++    STRATA_HD bool present() const { return k != nullptr && v != nullptr && tag != nullptr; }
++    STRATA_HD int rows() const { return sinks + tail; }
++};
++
++/// The row a position occupies, or -1 when it is not in the window at all: sinks keep rows 0..sinks-1, the newest
++/// `tail` positions cycle through the rest.  A row is only the CANDIDATE - the caller still compares `tag[row]`.
++STRATA_HD inline int kv_window_row(const KvExactWindow& w, long long pos) {
++    if (pos < 0) return -1;
++    if (pos < w.sinks) return (int) pos;
++    if (w.tail <= 0) return -1;
++    return w.sinks + (int) ((pos - w.sinks) % w.tail);
++}
++
++/// Bytes for one layer's window (K and V rows plus the tags).
++inline uint64_t kv_exact_window_bytes_per_layer(const QsaShapes& s, int sinks, int tail) {
++    const uint64_t row = (uint64_t) s.n_head_kv * (uint64_t) s.head_dim * 2u;
++    return (uint64_t) (sinks + tail) * row * 2u + (uint64_t) (sinks + tail) * 4u;
++}
++
++/// Zero the tags (no rows are valid) and initialise the geometry. `pos_stride` is the append step record's stride
++/// in int32s, the same record kv_append_* already reads kStepPos from.
++void kv_exact_window_init(KvExactWindow& w, const QsaShapes& s, int layers, int sinks, int tail, int pos_stride, void* stream);
++
++/// Record the cell at `step[kStepPos]` (with the raw (unrotated for oct3, rotated for q4_0) K/V the append kernel
++/// gets). Sinks are written once; a ring row is overwritten and its tag replaced, which is what evicts the oldest.
++void kv_exact_window_append(const KvExactWindow& w, int layer, const int32_t* step, const float* kcur, const float* vcur,
++                      int n_cells, void* stream);
++
++/// The prompt path: cells `pos0 .. pos0+n-1` of a contiguous K/V block [n][n_head_kv][head_dim].  `end` is the
++/// position the prompt will end at (exclusive): a cell that is neither a sink nor within `tail` of `end` can never
++/// be in the window once the prompt is complete, so it is skipped.  Only the last `tail` cells of a chunk are
++/// written, which is also what keeps the tag stores race-free (one writer per row).
++void kv_exact_window_append_range(const KvExactWindow& w, int layer, int64_t pos0, int64_t end, const float* kcur,
++                      const float* vcur, int64_t n_cells, void* stream);
++
++/// Gather `n` positions of `layer` into fp16 scratch [n][n_head_kv][head_dim].  A position the window does not hold
++/// is left untouched, so a caller that gathers AFTER the quantized pool keeps the pool's value there; `hit` (may be
++/// null) receives 1 for a gathered position and 0 for one it kept.
++void kv_exact_window_gather(const KvExactWindow& w, int layer, const int32_t* positions, int64_t n, uint16_t* k_out,
++                      uint16_t* v_out, int32_t* hit, void* stream);
++
++}  // namespace strata::kernels
+diff --git a/include/strata/kernels/kv_octave.hpp b/include/strata/kernels/kv_octave.hpp
+new file mode 100644
+index 00000000..9e9d1d3e
+--- /dev/null
++++ b/include/strata/kernels/kv_octave.hpp
+@@ -0,0 +1,86 @@
++// include/strata/kernels/kv_octave.hpp - 3-bit KV codes on a Lloyd-Max grid (`--kv octave3`, the structure
++// vLLM's Octave KV reports: random signs + Walsh-Hadamard rotation, then a fixed 8-level Gaussian codebook,
++// packed 3 bits per value, read back without a dequantized copy).
++//
++// The rotation is the one q4_0 already ships (kv_q4.hpp), so K, V and the query all pass through fwht256 and
++// <Hq, Hk> = <q, k> keeps the scores; the attention output is rotated back with H (self-inverse).
++//
++// 32 values per group: one fp16 scale plus three 32-bit bit-planes = 14 B, so 112 B per head per cell
++// (256 values) against 144 for q4_0 and 528 for int8. A cell (2 KV heads, K and V) is 448 B against 816 for
++// k8v4 (-45%) and 576 for q4_0 (-22%).
++//
++// THE CODEBOOK is the Lloyd-Max quantizer for N(0,1) at 3 bits: levels +-0.2451, +-0.7560, +-1.3439,
++// +-2.1519, boundaries +-0.5005, +-1.0500, +-1.7479, distortion 0.0345 per coordinate. It is computed, not
++// remembered (the 8-level Lloyd fixed point for N(0,1)), then held as int8 values in units of 1/32 --
++// 8, 24, 43, 69 -- because that is what makes a code usable as a byte-indexed table entry (v_perm_b32) later.
++// The decision thresholds below are the midpoints of the ROUNDED levels (16, 33.5, 56 in those units), so the
++// quantizer is exactly nearest-neighbour for the table that is actually stored.
++//
++// THE SCALE keeps the projection: s = |x|^2 / (x . L), so <x, sL> = |x|^2 exactly. Octave KV reports that the
++// least-squares scale (x.L / |L|^2) instead shrinks every vector, flattens the softmax and costs 2-3x the
++// NLL, so this is the one to keep.
++#pragma once
++
++#include "strata/kernels/qsa.hpp"
++
++#include <cstdint>
++
++namespace strata::kernels {
++
++inline constexpr int QK_OCT = 32;   // values per group
++
++#pragma pack(push, 1)
++/// 32 3-bit codes as three bit-planes: bit b of value j is bit j of word b (little-endian words).
++struct block_oct3 {
++    uint16_t d;        // scale (fp16 bits), multiplies the level table
++    uint8_t qs[12];    // three uint32 bit-planes
++};
++#pragma pack(pop)
++
++static_assert(sizeof(block_oct3) == 14, "block_oct3 must be 14 bytes");
++
++/// Code -> level, in units of 1/32. Codes 0-3 are the positive half, 4-7 the negative one.
++inline constexpr int8_t kOctLevel[8] = {8, 24, 43, 69, -8, -24, -43, -69};
++/// Nearest-level thresholds on |x| * 32 (midpoints of the stored levels).
++inline constexpr float kOctThreshold[3] = {16.0f, 33.5f, 56.0f};
++
++inline uint64_t kv_oct_bytes_per_head(int head_dim) {
++    return (uint64_t) (head_dim / QK_OCT) * sizeof(block_oct3);
++}
++
++/// Bytes per cell (one token, one layer): K and V of every KV head.
++inline uint64_t kv_oct_bytes_per_cell(const QsaShapes& s) {
++    return (uint64_t) s.n_head_kv * kv_oct_bytes_per_head((int) s.head_dim) * 2;
++}
++
++/// Quantize `n_groups` groups of QK_OCT values (row-major, ALREADY rotated by fwht256). One warp per group.
++void kv_oct_quantize(const float* src, uint8_t* dst, int64_t n_groups, void* stream);
++
++/// Dequantize the same groups back to fp32, still in the rotated frame.
++void kv_oct_dequantize(const uint8_t* src, float* dst, int64_t n_groups, void* stream);
++
++/// The engine's storage calls, one for one with kv_append_q4_* / kv_gather_q4_step: the same page table, the same
++/// host copy for KV streaming, the same staging pool for the prompt path. K and V arrive ALREADY rotated by
++/// fwht256, exactly as kv_append_q4's do; the host and stage pools are KvHostPools' k_q4/v_q4 byte arrays sized
++/// with kv_oct_bytes_per_cell(). (KvHostPools is forward-declared here so this header stands on its own.)
++struct KvHostPools;
++
++void kv_append_oct_steps(uint8_t* k_oct, uint8_t* v_oct, const int32_t* page_table, const int32_t* step,
++                         int step_stride, int n_steps, const float* kcur, const float* vcur, const QsaShapes& s,
++                         void* stream, const KvHostPools* host = nullptr);
++void kv_append_oct_step(uint8_t* k_oct, uint8_t* v_oct, const int32_t* page_table, const int32_t* step,
++                        const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
++                        const KvHostPools* host = nullptr);
++void kv_append_oct(uint8_t* k_oct, uint8_t* v_oct, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,
++                   const float* V, const QsaShapes& s, void* stream, const KvHostPools* host = nullptr,
++                   const KvHostPools* stage = nullptr);
++void kv_gather_oct_step(const uint8_t* k_oct, const uint8_t* v_oct, const int32_t* page_table, const int32_t* ids,
++                        const int32_t* step, int64_t max_ids, const QsaShapes& s, uint16_t* k_scratch,
++                        uint16_t* v_scratch, void* stream);
++
++/// The host reference the GPU kernels are checked against: same pairwise summation tree (strides 16, 8, 4, 2, 1)
++/// and the same constants, so the bytes match bit for bit.
++void kv_oct_quantize_group_host(const float* x, block_oct3& blk);
++void kv_oct_dequantize_group_host(const block_oct3& blk, float* x);
++
++}  // namespace strata::kernels
+diff --git a/include/strata/kernels/kv_stream.hpp b/include/strata/kernels/kv_stream.hpp
+index 8108795b..0cf339cb 100644
+--- a/include/strata/kernels/kv_stream.hpp
++++ b/include/strata/kernels/kv_stream.hpp
+@@ -45,7 +45,7 @@ struct KvHostPools {
+ /// K8V4 (`--kv k8v4`: K as int8 codes + scales, V as rotated q4_0 - three runs, `k_q`, `k_scale`, `v_q4`).
+ /// (A bool `int8` argument still reads as kKvF16 / kKvInt8.)  kKvHybrid is 3, the number conversation snapshots
+ /// already give K8V4.
+-enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2, kKvHybrid = 3 };
++enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2, kKvHybrid = 3, kKvOct3 = 4 };
+ 
+ /// K8V4's halves as the single-format append kernels see them, so a hybrid layer's host copy (and the prompt path's
+ /// staging pool) is written by the same calls that write its VRAM pools: K is "int8 whose V is K", V is "q4_0 whose
+diff --git a/include/strata/kernels/qsa_decode_attn.hpp b/include/strata/kernels/qsa_decode_attn.hpp
+index e782035d..b361ea15 100644
+--- a/include/strata/kernels/qsa_decode_attn.hpp
++++ b/include/strata/kernels/qsa_decode_attn.hpp
+@@ -15,6 +15,7 @@
+ #pragma once
+ 
+ #include "strata/kernels/qsa.hpp"
++#include "strata/kernels/kv_exact_window.hpp"
+ 
+ #include <cstdint>
+ 
+@@ -29,7 +30,14 @@ struct QsaAttnPools {
+     const uint16_t* v_scale = nullptr;
+     const uint8_t* k_q4 = nullptr;      ///< q4_0 block_q4_0 [page][kv_head][page_size][head_dim / 32 * 18]
+     const uint8_t* v_q4 = nullptr;
++    /// k_q4/v_q4 hold 14-byte oct3 blocks (kv_octave.hpp) instead of 18-byte q4_0 ones - the pointers cannot say
++    /// which, so the format travels explicitly.
++    bool oct3 = false;
+     const int32_t* page_table = nullptr;
++    /// The exact fp16 window over this layer (kv_exact_window.hpp): a selected cell the window still holds is read
++    /// from it instead of from the codes above.  Empty (`!present()`) for every other format and when the window is
++    /// off - the kernels then run exactly the code they ran before.
++    KvExactWindow win;
+ };
+ 
+ /// Batch windows: every query's own K/V pools - query z reads p[z] (z < n).  n = 0: the call's one `pools`.
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index f9bbca02..0e1840d2 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -27,6 +27,10 @@ namespace strata::kernels::cpu { class ExpertPool; }
+ 
+ namespace strata::prefill {
+ 
++/// Flight recorder for the KV staging path (no synchronisation: it only records which step the prompt path is in).
++/// The stall report prints it, so a hang names its step without changing its timing.
++const char* kv_phase_text();
++
+ struct PrefillStats {
+     int64_t tokens = 0;
+     int64_t chunks = 0;
+diff --git a/src/core/conversation_snapshot.cpp b/src/core/conversation_snapshot.cpp
+index 76e69b5f..88fc0b25 100644
+--- a/src/core/conversation_snapshot.cpp
++++ b/src/core/conversation_snapshot.cpp
+@@ -1,4 +1,5 @@
+ #include "strata/core/conversation_snapshot.hpp"
++#include "strata/kernels/kv_octave.hpp"
+ #include "strata/kernels/kv_q4.hpp"
+ #include "conversation_checked.hpp"
+ #include "conversation_copy.hpp"
+@@ -40,8 +41,9 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
+         return false;
+     }
+     const int64_t cells = ((upto + s.page_size - 1) / s.page_size) * s.page_size;
+-    const size_t per = st.kv_q4 ? (size_t) strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
+-                              : (size_t) g.head_dim * (int8_keys ? 1 : 2);
++    const size_t per = st.kv_oct ? (size_t) strata::kernels::kv_oct_bytes_per_head((int) g.head_dim)
++                     : st.kv_q4 ? (size_t) strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
++                                : (size_t) g.head_dim * (int8_keys ? 1 : 2);
+     // Include the moving spare row, not only completed blocks. The checkpoint
+     // restore reconstructs that row when rewinding to an earlier prefix.
+     const int64_t pooled = index && upto > 0 ? upto / s.idx_block + 1 : 0;
+@@ -77,6 +79,8 @@ std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
+     if (st.kv_hybrid)
+         return {host ? st.host.k_q : st.k_q, host ? st.host.v_q4 : st.v_q4, host ? st.host.k_scale : st.k_scale,
+                 nullptr, st.idx_pooled};
++    if (st.kv_oct)
++        return {host ? st.host.k_q4 : st.k_q4, host ? st.host.v_q4 : st.v_q4, nullptr, nullptr, st.idx_pooled};
+     if (st.kv_q4)
+         return {host ? st.host.k_q4 : st.k_q4, host ? st.host.v_q4 : st.v_q4, nullptr, nullptr, st.idx_pooled};
+     if (st.kv_int8)
+@@ -102,16 +106,16 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
+         }
+     }
+     if (st.kv_mode == 2 && (!st.page_table ||
+-        (st.kv_q4 ? !st.k_q4 || !st.v_q4 : st.kv_int8 ? !st.k_q || !st.v_q || !st.k_scale || !st.v_scale
+-                                                    : !st.k_pool || !st.v_pool))) {
++        (st.kv_oct || st.kv_q4 ? !st.k_q4 || !st.v_q4
++                               : st.kv_int8 ? !st.k_q || !st.v_q || !st.k_scale || !st.v_scale
++                                            : !st.k_pool || !st.v_pool))) {
+         error = "conversation snapshot: invalid draft ring";
+         return false;
+     }
+     return true;
+ }
+ 
+-bool transfer(void* dst, const void* src, size_t n, std::string& error) {
+-    if (!n) return true;
++bool transfer(void* dst, const void* src, size_t n, std::string& error) {    if (!n) return true;
+     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
+     // Default handles both device allocations and device-mapped host pool aliases.
+     const cudaError_t e = conversation_detail::copy_nonblocking(dst, src, n);
+@@ -119,6 +123,18 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
+     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
+     return false;
+ }
++/// The exact window (`--kv oct3`) is a CACHE of the K/V, not part of the image: after a restore (or a copy into
++/// another state) its tags must not answer for positions this state's K/V did not write.  One synchronous 4-byte-
++/// per-row memset - the window is ~1.6 MiB in the worst case - and the rows refill as the sequence appends.
++bool invalidate_window(const QsaState& st, std::string& error) {
++    if (!st.win.present()) return true;
++    const cudaError_t e = cudaMemset(st.win.tag, 0xff, (size_t) st.win.layers * (size_t) st.win.rows() * sizeof(int32_t));
++    if (e != cudaSuccess) {
++        error = std::string("conversation snapshot: exact-window invalidate: ") + cudaGetErrorString(e);
++        return false;
++    }
++    return true;
++}
+ } // namespace
+ 
+ bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+@@ -248,6 +264,7 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
+         const cudaError_t e = conversation_detail::order_after_queued();
+         if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
+     }
++    if (!invalidate_window(to, error)) return false;
+     return refresh_residency(to, g, upto, error);
+ }
+ 
+@@ -260,6 +277,7 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
+         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+             })) return false;
++    if (!invalidate_window(st, error)) return false;
+     return refresh_residency(st, g, upto, error);
+ }
+ 
+@@ -281,6 +299,7 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
+         if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
+                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+             })) return false;
++    if (!invalidate_window(st, error)) return false;
+     return refresh_residency(st, g, upto, error);
+ }
+ 
+diff --git a/src/core/layer.cpp b/src/core/layer.cpp
+index 273b2293..ef8ad66b 100644
+--- a/src/core/layer.cpp
++++ b/src/core/layer.cpp
+@@ -10,6 +10,7 @@
+ #include "strata/kernels/gdn.hpp"
+ #include "strata/kernels/qsa.hpp"
+ #include "strata/kernels/kv_q4.hpp"
++#include "strata/kernels/kv_octave.hpp"
+ #include "strata/kernels/kv_q8.hpp"
+ #include "strata/kernels/quantize_act.hpp"
+ #include "strata/kernels/fuse_decode.hpp"
+@@ -201,12 +202,55 @@ if (!w.wants_q8k()) {        s_gemv_q8_0_split(x80, p.codes, p.scales, p.offset,
+ // namespace
+ void layer_set_native_bf16(bool enabled) { native_bf16_projections = enabled; }
+ void layer_set_native_flash_attn_short(bool enabled) { native_flash_attn_short = enabled; }
+-namespace { bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false, g_kv_int8_rot = false; }
++namespace { bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false, g_kv_int8_rot = false, g_kv_oct = false; }
+ void qsa_set_kv_int8(bool enabled) { g_kv_int8 = enabled; }
+ void qsa_set_kv_int8_rotate(bool enabled) { g_kv_int8_rot = enabled; }
+ bool qsa_kv_int8() { return g_kv_int8; }
+ void qsa_set_kv_q4(bool enabled) { g_kv_q4 = enabled; }
+ bool qsa_kv_q4() { return g_kv_q4; }
++void qsa_set_kv_oct(bool enabled) { g_kv_oct = enabled; }
++bool qsa_kv_oct() { return g_kv_oct; }
++// THE EXACT WINDOW of --kv oct3 (kv_exact_window.hpp): the first `sinks` and the newest `tail` cells kept in fp16
++// beside the 3-bit codes.  vLLM's Octave KV reports the same model at +0.0395 nats with plain 3-bit and +0.0163 with
++// this window, because a sparse selection puts 35-80% of the attention mass on a handful of recent cells and their
++// quantization error does not average out.  STRATA_KV_WINDOW=0 turns it off; the two sizes are A/B knobs.
++//
++// The tail is 1024, not vLLM's 64: measured against this engine's fp16 KV over 5 x 6000-token segments (top-1 / mean KL
++// to fp16, tools/quant_quality.py), no window 91.63% / 0.0526, 64 cells 93.62% / 0.0334, 256 cells 94.24% / 0.0256,
++// 1024 cells 95.27% / 0.0185 (and the same ordering at 1K: 89.75 / 0.0862 -> 93.01 / 0.0515 with 64 -> 94.03 / 0.0370
++// with 256).  Each doubling is cheaper in quality than the last, and 1024 cells cost 12 * 2 MiB = 25 MiB of VRAM -
++// 3.6% of what the same cells would cost in an fp16 cache.  Measured cost: the same ms per forward as 256 cells and
++// the same draft acceptance as a k8v4 verifier on the same prompts, so the tail buys quality for no throughput.
++namespace {
++bool kv_window_on() {
++    static const bool on = [] {
++        const char* e = std::getenv("STRATA_KV_WINDOW");
++        return !(e != nullptr && e[0] == '0');
++    }();
++    return on;
++}
++int kv_window_sinks() {
++    static const int n = [] {
++        const char* e = std::getenv("STRATA_KV_WINDOW_SINKS");
++        const int v = e != nullptr ? std::atoi(e) : 4;
++        return v >= 0 ? v : 4;
++    }();
++    return n;
++}
++int kv_window_tail() {
++    static const int n = [] {
++        const char* e = std::getenv("STRATA_KV_WINDOW_TAIL");
++        const int v = e != nullptr ? std::atoi(e) : 1024;
++        return v >= 0 ? v : 1024;
++    }();
++    return n;
++}
++}  // namespace
++void qsa_window_sizes(int& sinks, int& tail) {
++    const bool on = g_kv_oct && kv_window_on() && kv_window_sinks() + kv_window_tail() > 0;
++    sinks = on ? kv_window_sinks() : 0;
++    tail = on ? kv_window_tail() : 0;
++}
+ void qsa_set_kv_hybrid(bool enabled) { g_kv_hybrid = enabled; }
+ bool qsa_kv_hybrid() { return g_kv_hybrid; }
+ uint64_t gdn_buffers_bytes(const ModelGeometry& g) {    const int64_t C = g.ssm_conv_channels;    const int64_t V = g.ssm_value_dim;    const uint64_t parts[] = {        q8k_bytes(g.n_embd),
+@@ -760,6 +804,7 @@ uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8
+         return rows * (uint64_t) s.head_dim + rows * (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2 +
+                rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim) + 64;
+     }
++    if (g_kv_oct) return (uint64_t) pages * s.page_size * strata::kernels::kv_oct_bytes_per_cell(s) + 64;
+     if (g_kv_q4) return (uint64_t) pages * s.page_size * strata::kernels::kv_q4_bytes_per_cell(s) + 64;
+     return int8 ? (uint64_t) pages * s.page_size * strata::kernels::kv_q8_bytes_per_cell(s) + 64
+                 : (uint64_t) pages * s.n_head_kv * s.page_size * s.head_dim * 2 * 2;
+@@ -787,6 +832,8 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
+     if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
+     n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
+     n += (uint64_t) s.n_head * 4;                                              // pos_dev
++    if (g_kv_oct && p.mode != 2 && kv_window_on() && kv_window_sinks() + kv_window_tail() > 0)
++        n += strata::kernels::kv_exact_window_bytes_per_layer(s, kv_window_sinks(), kv_window_tail()) + 16;  // the window
+     return align_up16(n) + 256;
+ }
+ 
+@@ -796,8 +843,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
+     const KvPlan p = kv_plan(s, max_cells, ring_cells);
+     const int64_t pages = p.pages;
+     Cursor c{(uint8_t*) base};
+-    st.kv_int8 = g_kv_int8 && !g_kv_q4;
+-    st.kv_q4 = g_kv_q4;
++    st.kv_int8 = g_kv_int8 && !g_kv_q4 && !g_kv_oct;
++    st.kv_q4 = g_kv_q4 && !g_kv_oct;
++    st.kv_oct = g_kv_oct;
+     // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
+     // mtp.cpp). A streamed one keeps its host copy in the same three runs (kv_stream.cu, kKvHybrid).
+     if (g_kv_hybrid && ring_cells <= 0) {
+@@ -805,11 +853,12 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
+         st.kv_int8 = false;
+         st.kv_q4 = false;
+     }
+-    st.kv_rot = st.kv_q4 || (st.kv_int8 && g_kv_int8_rot);   // K8V4 rotates only V (below)
++    st.kv_rot = st.kv_q4 || st.kv_oct || (st.kv_int8 && g_kv_int8_rot);   // K8V4 rotates only V (below)
+     st.kv_mode = p.mode;
+     st.n_slots = p.slots;
+     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
+     const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
++    const uint64_t oct_row = strata::kernels::kv_oct_bytes_per_head((int) s.head_dim);
+     st.kv_elastic = -1;
+     if (g_kv_elastic && p.mode == 0) {
+         // the elastic K/V: each array at a chunk boundary of the state's own range, the first cells mapped
+@@ -817,6 +866,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
+         const uint64_t scale_row = (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+         std::vector<uint64_t> per;   // bytes per page slot of each array, in the order they are assigned below
+         if (st.kv_hybrid) per = {slot_rows * s.head_dim, slot_rows * scale_row, slot_rows * q4_row};
++        else if (st.kv_oct) per = {slot_rows * oct_row, slot_rows * oct_row};
+         else if (st.kv_q4) per = {slot_rows * q4_row, slot_rows * q4_row};
+         else if (st.kv_int8) per = {slot_rows * s.head_dim, slot_rows * s.head_dim, slot_rows * scale_row, slot_rows * scale_row};
+         else per = {slot_rows * s.head_dim * 2, slot_rows * s.head_dim * 2};
+@@ -837,6 +887,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
+         uint8_t* b = pool->range.base();
+         const uint64_t* o = pool->off.data();
+         if (st.kv_hybrid) { st.k_q = (int8_t*) (b + o[0]); st.k_scale = (uint16_t*) (b + o[1]); st.v_q4 = b + o[2]; }
++        else if (st.kv_oct) { st.k_q4 = b + o[0]; st.v_q4 = b + o[1]; }
+         else if (st.kv_q4) { st.k_q4 = b + o[0]; st.v_q4 = b + o[1]; }
+         else if (st.kv_int8) {
+             st.k_q = (int8_t*) (b + o[0]);
+@@ -850,6 +901,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
+         st.k_q = c.take<int8_t>(rows * s.head_dim);
+         st.k_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+         st.v_q4 = c.take<uint8_t>(rows * q4_row);
++    } else if (st.kv_oct) {   // the same two byte arrays as Q4_0, at 14-byte blocks
++        st.k_q4 = c.take<uint8_t>(rows * oct_row);
++        st.v_q4 = c.take<uint8_t>(rows * oct_row);
+     } else if (st.kv_q4) {
+         st.k_q4 = c.take<uint8_t>(rows * q4_row);
+         st.v_q4 = c.take<uint8_t>(rows * q4_row);
+@@ -892,6 +946,17 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
+     st.step = c.take<int32_t>((uint64_t) strata::kernels::kStepCount);
+     st.attention_status = c.take<int32_t>(1);
+     st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
++    // the exact window: one layer's sinks + ring, fp16, plus the row tags (kv_exact_window.hpp).  Sized here and
++    // read as layer 0 everywhere, because a QsaState IS one layer.
++    st.win = strata::kernels::KvExactWindow{};
++    if (st.kv_oct && p.mode != 2 && kv_window_on() && kv_window_sinks() + kv_window_tail() > 0) {
++        const int sinks = kv_window_sinks(), tail = kv_window_tail();
++        const uint64_t wrows = (uint64_t) (sinks + tail) * (uint64_t) (s.n_head_kv * s.head_dim);
++        st.win.k = c.take<uint16_t>(wrows);
++        st.win.v = c.take<uint16_t>(wrows);
++        st.win.tag = c.take<int32_t>((uint64_t) (sinks + tail));
++        strata::kernels::kv_exact_window_init(st.win, s, 1, sinks, tail, strata::kernels::kStepCount, nullptr);
++    }
+     // the pinned staging the uploads copy FROM - see the note on `host_step` in the header
+     if (strata::core::host_alloc_guarded((void**) &st.host_step, strata::kernels::qsa_step_bytes() + sizeof(int32_t),
+                       cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+@@ -922,6 +987,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
+             st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
+             st.host.k_scale = hc.take<uint16_t>(hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+             st.host.v_q4 = hc.take<uint8_t>(hrows * q4_row);
++        } else if (st.kv_oct) {   // the same two byte arrays as Q4_0, at 14-byte blocks
++            st.host.k_q4 = hc.take<uint8_t>(hrows * oct_row);
++            st.host.v_q4 = hc.take<uint8_t>(hrows * oct_row);
+         } else if (st.kv_q4) {
+             st.host.k_q4 = hc.take<uint8_t>(hrows * q4_row);
+             st.host.v_q4 = hc.take<uint8_t>(hrows * q4_row);
+@@ -974,6 +1042,9 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
+         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
+         cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
+         cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
++    } else if (st.kv_oct) {
++        cudaMemsetAsync(st.k_q4, 0, rows * strata::kernels::kv_oct_bytes_per_head((int) s.head_dim), cs);
++        cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_oct_bytes_per_head((int) s.head_dim), cs);
+     } else if (st.kv_q4) {
+         cudaMemsetAsync(st.k_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
+         cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
+@@ -993,15 +1064,25 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
+     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
+     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
+     cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
++    qsa_window_invalidate(st, stream);
++}
++
++void qsa_window_invalidate(const QsaState& st, void* stream) {
++    if (!st.win.present()) return;
++    // -1 in every tag: no row answers for any position until this sequence writes one (the append path does).
++    cudaMemsetAsync(st.win.tag, 0xff, (size_t) st.win.layers * (size_t) st.win.rows() * sizeof(int32_t),
++                    (cudaStream_t) stream);
+ }
+ 
+ strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
+     strata::kernels::QsaAttnPools pools;
+     pools.page_table = st.page_table;
++    pools.oct3 = st.kv_oct;
+     if (st.kv_hybrid) { pools.k_q = st.k_q; pools.k_scale = st.k_scale; pools.v_q4 = st.v_q4; }
+-    else if (st.kv_q4) { pools.k_q4 = st.k_q4; pools.v_q4 = st.v_q4; }
++    else if (st.kv_q4 || st.kv_oct) { pools.k_q4 = st.k_q4; pools.v_q4 = st.v_q4; }
+     else if (st.kv_int8) { pools.k_q = st.k_q; pools.v_q = st.v_q; pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; }
+     else { pools.k_pool = st.k_pool; pools.v_pool = st.v_pool; }
++    pools.win = st.win;   // empty unless --kv oct3 with the window on (kv_exact_window.hpp)
+     return pools;
+ }
+ 
+@@ -1222,7 +1303,11 @@ if (st.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0, and INT8 with STRATA_KV
+     strata::kernels::fwht256_inplace_cuda(b.kcur, g.n_head_kv, stream);
+     strata::kernels::fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);
+ }
+-if (st.kv_q4) {
++if (st.kv_oct) {
++    strata::kernels::kv_append_oct_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);
++    // the exact window gets the SAME rotated values the codes were built from, so a hit is a strictly better copy
++    strata::kernels::kv_exact_window_append(st.win, 0, st.step, b.kcur, b.vcur, 1, stream);
++} else if (st.kv_q4) {
+     strata::kernels::kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);
+ } else if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host); } /* not K8V4 */    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};        if (native_qsa_indexer_enabled()) {
+     try {
+@@ -1261,7 +1346,7 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
+     // KV streaming: every block the selection names is made resident before anything reads it
+     qsa_kv_resolve(st, g, b.ids, st.step, 1, cap, stream);
+     if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(b.qcur, g.n_head, stream);   // <Hq, Hk> = <q, k>
+-    if (g_fast_attn && !native_flash_attn_short && dump == nullptr) {
++    if (g_fast_attn && !st.kv_oct && !native_flash_attn_short && dump == nullptr) {   // oct3: gather path only
+         const strata::kernels::QsaAttnPools pools = qsa_attn_pools(st);
+         strata::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);
+     } else {
+@@ -1271,6 +1356,13 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
+         strata::kernels::kv_gather_q4_step(st.v_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s,
+                                            b.v_scratch, b.v_scratch, stream);
+     }
++    else if (st.kv_oct) {
++        strata::kernels::kv_gather_oct_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
++        // then the exact window over the top, for the cells it still holds (sinks + the newest tail); everything it
++        // does not hold keeps the codes' value, which is why the two gathers run in this order.  `cap` (not the
++        // selection's width) is the grid, as for the gather above: a slot past the width is never read back.
++        strata::kernels::kv_exact_window_gather(st.win, 0, b.ids, cap, b.k_scratch, b.v_scratch, nullptr, stream);
++    }
+     else if (st.kv_q4) strata::kernels::kv_gather_q4_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
+     else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,                                 b.k_scratch, b.v_scratch, stream);
+     else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch,                   stream);
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index f4b82b33..08d76f22 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -347,8 +347,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
+     // only, whatever ring shape it takes (0, a window, or the -1 fully-resident fallback).
+     const bool kv_hybrid_was = qsa_kv_hybrid();
+     const bool kv_int8_was = qsa_kv_int8();
++    const bool kv_oct_was = qsa_kv_oct();
+     qsa_set_kv_hybrid(false);
+-    if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
++    qsa_set_kv_oct(false);   // oct3 never applies to the drafter, for the same reason K8V4 does not
++    if (kv_hybrid_was || kv_oct_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4 / oct3: plain INT8
+     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
+     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
+     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
+@@ -364,6 +366,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
+     }
+     qsa_set_kv_int8(kv_int8_was);
+     qsa_set_kv_hybrid(kv_hybrid_was);
++    qsa_set_kv_oct(kv_oct_was);
+     qsa_state_zero(st_, g, nullptr);
+     cudaDeviceSynchronize();
+     vram_ += sb;
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 3d6f48b2..a4848e38 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -36,6 +36,7 @@
+ #include "strata/kernels/cvec.hpp"
+ #include "strata/kernels/gr.hpp"
+ #include "strata/kernels/kv_q4.hpp"
++#include "strata/kernels/kv_octave.hpp"
+ #include "strata/kernels/kv_q8.hpp"
+ #include "strata/kernels/native_mmvq.hpp"
+ #include "strata/kernels/native_gr_postops.hpp"
+@@ -1754,7 +1755,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                                            kc_b, kc_b, (int) (NKV * HD), n, s, cs, mirror ? &hk : nullptr);
+                         kv_append_q4_steps(st.v_q4, st.v_q4, st.page_table, step_b, kStepCount, n, vc_b, vc_b, s, cs,
+                                            mirror ? &hv : nullptr);
+-                    } else if (st.kv_q4)
++                    } else if (st.kv_oct) {
++                        kv_append_oct_steps(st.k_q4, st.v_q4, st.page_table, step_b, kStepCount, n, kc_b, vc_b, s, cs,
++                                            &st.host);
++                        // the exact window: the same rotated K/V, fp16, for the cells it keeps (kv_exact_window.hpp)
++                        strata::kernels::kv_exact_window_append(st.win, 0, step_b, kc_b, vc_b, n, cs);
++                    }
++                    else if (st.kv_q4)
+                         kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_b, kStepCount, n, kc_b, vc_b, s, cs,
+                                            &st.host);
+                     else if (st.kv_int8)
+@@ -1775,7 +1782,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                                           kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs, mirror ? &hk : nullptr);
+                         kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
+                                           vcur_ + t * NKV * HD, s, cs, mirror ? &hv : nullptr);
+-                    } else if (st.kv_q4)
++                    } else if (st.kv_oct) {
++                        kv_append_oct_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
++                                           vcur_ + t * NKV * HD, s, cs, &st.host);
++                        strata::kernels::kv_exact_window_append(st.win, 0, step_t, kcur_ + t * NKV * HD,
++                                                               vcur_ + t * NKV * HD, 1, cs);
++                    }
++                    else if (st.kv_q4)
+                         kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
+                                           vcur_ + t * NKV * HD, s, cs, &st.host);
+                     else if (st.kv_int8)
+diff --git a/src/kernels/cuda/kv_exact_window.cu b/src/kernels/cuda/kv_exact_window.cu
+new file mode 100644
+index 00000000..d66ab6bd
+--- /dev/null
++++ b/src/kernels/cuda/kv_exact_window.cu
+@@ -0,0 +1,112 @@
++// src/kernels/cuda/kv_exact_window.cu - see include/strata/kernels/kv_exact_window.hpp.
++#include "strata/kernels/kv_exact_window.hpp"
++#include "strata/kernels/f16_bits.hpp"
++#include "strata/kernels/kv_stream.hpp"   // kStepPos
++
++#include <cuda_runtime.h>
++
++#include <cstdio>
++#include <cstdlib>
++
++namespace strata::kernels {
++namespace {
++
++void check(const char* what) {
++    const cudaError_t e = cudaGetLastError();
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "kv_exact_window: %s: %s\n", what, cudaGetErrorString(e));
++        std::exit(1);
++    }
++}
++
++__global__ void kv_exact_window_append_kernel(KvExactWindow w, int layer, const int32_t* __restrict__ step,
++                                        const float* __restrict__ kcur, const float* __restrict__ vcur, int n_cells) {
++    const int c = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
++    const long long pos = __ldg(step + (long long) c * w.pos_stride + kStepPos);
++    const int row = kv_window_row(w, pos);
++    if (row < 0) return;
++    const size_t src = ((size_t) c * w.n_head_kv + h) * w.head_dim + d;
++    const size_t dst = ((size_t) layer * w.rows() + row) * (size_t) (w.n_head_kv * w.head_dim) +
++                       (size_t) h * w.head_dim + d;
++    w.k[dst] = f16_from_f32(kcur[src]);
++    w.v[dst] = f16_from_f32(vcur[src]);
++    if (d == 0 && h == 0) w.tag[(size_t) layer * w.rows() + row] = (int32_t) pos;
++}
++
++/// The prompt path. `end` is the position the prompt ends at, so a cell older than `end - tail` (and not a sink)
++/// can never be in the window: it is skipped, which bounds the launch and keeps one writer per ring row.
++__global__ void kv_exact_window_append_range_kernel(KvExactWindow w, int layer, long long pos0, long long end,
++                                                    const float* __restrict__ kcur, const float* __restrict__ vcur,
++                                                    long long n_cells) {
++    const long long c = blockIdx.x;
++    if (c >= n_cells) return;
++    const long long pos = pos0 + c;
++    if (pos >= w.sinks && pos < end - w.tail) return;
++    const int row = kv_window_row(w, pos);
++    if (row < 0) return;
++    const int h = blockIdx.y, d = threadIdx.x;
++    const size_t src = ((size_t) c * w.n_head_kv + h) * w.head_dim + d;
++    const size_t dst = ((size_t) layer * w.rows() + row) * (size_t) (w.n_head_kv * w.head_dim) +
++                       (size_t) h * w.head_dim + d;
++    w.k[dst] = f16_from_f32(kcur[src]);
++    w.v[dst] = f16_from_f32(vcur[src]);
++    if (d == 0 && h == 0) w.tag[(size_t) layer * w.rows() + row] = (int32_t) pos;
++}
++
++__global__ void kv_exact_window_gather_kernel(const KvExactWindow w, int layer, const int32_t* __restrict__ positions, int64_t n,
++                                        uint16_t* __restrict__ k_out, uint16_t* __restrict__ v_out,
++                                        int32_t* __restrict__ hit) {
++    const int64_t i = blockIdx.x;
++    if (i >= n) return;
++    const int h = blockIdx.y, d = threadIdx.x;
++    const long long pos = __ldg(positions + i);
++    const int row = kv_window_row(w, pos);
++    const int ok = row >= 0 && __ldg(w.tag + (size_t) layer * w.rows() + row) == (int32_t) pos;
++    if (d == 0 && h == 0 && hit != nullptr) hit[i] = ok;
++    if (!ok) return;
++    const size_t src = ((size_t) layer * w.rows() + row) * (size_t) (w.n_head_kv * w.head_dim) +
++                       (size_t) h * w.head_dim + d;
++    const size_t dst = ((size_t) i * w.n_head_kv + h) * w.head_dim + d;
++    k_out[dst] = w.k[src];
++    v_out[dst] = w.v[src];
++}
++
++}  // namespace
++
++void kv_exact_window_init(KvExactWindow& w, const QsaShapes& s, int layers, int sinks, int tail, int pos_stride, void* stream) {
++    w.layers = layers;
++    w.sinks = sinks;
++    w.tail = tail;
++    w.n_head_kv = (int) s.n_head_kv;
++    w.head_dim = (int) s.head_dim;
++    w.pos_stride = pos_stride;
++    if (!w.present() || layers <= 0 || w.rows() <= 0) return;
++    cudaMemsetAsync(w.tag, 0xff, (size_t) layers * (size_t) w.rows() * sizeof(int32_t), (cudaStream_t) stream);
++    check("tag memset");
++}
++
++void kv_exact_window_append(const KvExactWindow& w, int layer, const int32_t* step, const float* kcur, const float* vcur,
++                      int n_cells, void* stream) {
++    if (!w.present() || n_cells <= 0) return;
++    kv_exact_window_append_kernel<<<dim3((unsigned) n_cells, (unsigned) w.n_head_kv), (unsigned) w.head_dim, 0,
++                              (cudaStream_t) stream>>>(w, layer, step, kcur, vcur, n_cells);
++    check("append launch");
++}
++
++void kv_exact_window_append_range(const KvExactWindow& w, int layer, int64_t pos0, int64_t end, const float* kcur,
++                      const float* vcur, int64_t n_cells, void* stream) {
++    if (!w.present() || n_cells <= 0) return;
++    kv_exact_window_append_range_kernel<<<dim3((unsigned) n_cells, (unsigned) w.n_head_kv), (unsigned) w.head_dim, 0,
++                                    (cudaStream_t) stream>>>(w, layer, pos0, end, kcur, vcur, n_cells);
++    check("append range launch");
++}
++
++void kv_exact_window_gather(const KvExactWindow& w, int layer, const int32_t* positions, int64_t n, uint16_t* k_out,
++                      uint16_t* v_out, int32_t* hit, void* stream) {
++    if (!w.present() || n <= 0) return;
++    kv_exact_window_gather_kernel<<<dim3((unsigned) n, (unsigned) w.n_head_kv), (unsigned) w.head_dim, 0,
++                              (cudaStream_t) stream>>>(w, layer, positions, n, k_out, v_out, hit);
++    check("gather launch");
++}
++
++}  // namespace strata::kernels
+diff --git a/src/kernels/cuda/kv_octave.cu b/src/kernels/cuda/kv_octave.cu
+new file mode 100644
+index 00000000..66739995
+--- /dev/null
++++ b/src/kernels/cuda/kv_octave.cu
+@@ -0,0 +1,290 @@
++// src/kernels/cuda/kv_octave.cu - see include/strata/kernels/kv_octave.hpp. 3-bit KV on a Lloyd-Max grid.
++//
++// One warp per 32-value group, the same shape kv_q4.cu uses, so the append/gather entry points below mirror its
++// page table, host copy and staging pool one for one. The two reductions use the same pairwise tree as the host
++// reference (strides 16, 8, 4, 2, 1 through __shfl_down_sync), so its bytes match this kernel's bit for bit.
++//
++// The codes go out as three bit-planes by __ballot_sync, and every store/load is BYTE-wise: block_oct3 is 14
++// bytes, so its qs starts at offset 2 and a uint32 view of it is a misaligned access (measured: garbage codes).
++#include "strata/kernels/kv_octave.hpp"
++#include "strata/kernels/f16_bits.hpp"
++#include "strata/kernels/kv_stream.hpp"   // kStepPos, kStepWidth, KvHostPools
++
++#include <cuda_runtime.h>
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++namespace strata::kernels {
++namespace {
++
++void check(const char* what) {
++    const cudaError_t e = cudaGetLastError();
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "kv_octave: %s: %s\n", what, cudaGetErrorString(e));
++        std::exit(1);
++    }
++}
++
++/// The total lands in lane 0; every lane needs it, so it is broadcast back.
++__device__ __forceinline__ float warp_sum_bcast(float v) {
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
++    return __shfl_sync(0xffffffffu, v, 0);
++}
++
++__device__ __forceinline__ int oct_code(float x, float s0) {
++    if (!(s0 > 0.0f)) return 0;
++    const float a = fabsf(x / s0) * 32.0f;
++    const int m = a < kOctThreshold[0] ? 0 : (a < kOctThreshold[1] ? 1 : (a < kOctThreshold[2] ? 2 : 3));
++    return m + (x < 0.0f ? 4 : 0);
++}
++
++/// One 32-value group in one warp: returns this lane's code and the group's projection-preserving scale.
++struct OctGroup {
++    int code;
++    float d;
++};
++
++__device__ __forceinline__ OctGroup oct_group(float x) {
++    const float sxx = warp_sum_bcast(x * x);
++    const float s0 = sxx > 0.0f ? sqrtf(sxx / (float) QK_OCT) : 0.0f;
++    const int code = oct_code(x, s0);
++    const float level = s0 > 0.0f ? (float) kOctLevel[code] * (1.0f / 32.0f) : 0.0f;
++    const float sxL = warp_sum_bcast(x * level);
++    return OctGroup{code, sxL > 0.0f ? sxx / sxL : 0.0f};
++}
++
++/// All 32 lanes of the warp must call this together (the ballots are what pack the block).
++__device__ __forceinline__ void oct_store(block_oct3* blk, int lane, OctGroup g) {
++    const uint32_t w0 = __ballot_sync(0xffffffffu, (g.code & 1) != 0);
++    const uint32_t w1 = __ballot_sync(0xffffffffu, (g.code & 2) != 0);
++    const uint32_t w2 = __ballot_sync(0xffffffffu, (g.code & 4) != 0);
++    if (lane == 0) blk->d = f16_from_f32(g.d);
++    if (lane < 3) {
++        const uint32_t w = lane == 0 ? w0 : (lane == 1 ? w1 : w2);
++        uint8_t* q = blk->qs + lane * 4;
++        q[0] = (uint8_t) (w & 0xffu);
++        q[1] = (uint8_t) ((w >> 8) & 0xffu);
++        q[2] = (uint8_t) ((w >> 16) & 0xffu);
++        q[3] = (uint8_t) ((w >> 24) & 0xffu);
++    }
++}
++
++__device__ __forceinline__ void oct_store_row(uint8_t* pool, long long row, int b, int lane, OctGroup g) {
++    block_oct3* blk = reinterpret_cast<block_oct3*>(pool + row * (long long) sizeof(block_oct3) * 8) + b;
++    oct_store(blk, lane, g);
++}
++
++/// This lane's three bits of `blk`, read as bytes (same alignment reason as the writer).
++__device__ __forceinline__ int oct_load_code(const block_oct3* blk, int lane) {
++    const uint8_t* q = blk->qs;
++    const int by = lane >> 3, bi = lane & 7;
++    return ((q[by] >> bi) & 1) | (((q[4 + by] >> bi) & 1) << 1) | (((q[8 + by] >> bi) & 1) << 2);
++}
++
++__device__ __forceinline__ float oct_level(int code) { return (float) kOctLevel[code] * (1.0f / 32.0f); }
++
++// ---- standalone (contiguous groups) ---------------------------------------------------------------
++__global__ void kv_oct_quantize_kernel(const float* __restrict__ src, uint8_t* __restrict__ dst, int64_t n_groups) {
++    const int64_t g = blockIdx.x;
++    if (g >= n_groups) return;
++    const int lane = threadIdx.x;
++    const OctGroup r = oct_group(src[g * QK_OCT + lane]);
++    oct_store(reinterpret_cast<block_oct3*>(dst) + g, lane, r);
++}
++
++__global__ void kv_oct_dequantize_kernel(const uint8_t* __restrict__ src, float* __restrict__ dst, int64_t n_groups) {
++    const int64_t g = blockIdx.x;
++    if (g >= n_groups) return;
++    const int lane = threadIdx.x;
++    const block_oct3* blk = reinterpret_cast<const block_oct3*>(src) + g;
++    dst[g * QK_OCT + lane] = f32_from_f16(blk->d) * oct_level(oct_load_code(blk, lane));
++}
++
++// ---- the engine's entry points, shaped like kv_q4.cu's -------------------------------------------
++// grid (kv_heads, blocks_per_head, n_steps * planes), 32 threads: one element of one 32-value group.
++__global__ void kv_append_oct_kernel(uint8_t* __restrict__ k_oct, uint8_t* __restrict__ v_oct,
++                                     const int32_t* __restrict__ table, const int32_t* __restrict__ step,
++                                     int step_stride, int planes, const float* __restrict__ kcur,
++                                     const float* __restrict__ vcur, int kv_heads, int head_dim, int page_size,
++                                     KvHostPools host) {
++    const int step_idx = (int) (blockIdx.z / (unsigned) planes);
++    const bool is_v = (blockIdx.z % (unsigned) planes) == 1u;
++    const long long pos = (long long) __ldg(step + (long long) step_idx * step_stride + kStepPos);
++    const int h = blockIdx.x, b = blockIdx.y, t = threadIdx.x;
++    const long long step_off = (long long) step_idx * kv_heads * head_dim;
++    const float x = (is_v ? vcur : kcur)[step_off + h * head_dim + b * QK_OCT + t];
++    const OctGroup g = oct_group(x);
++    const long long page = (long long) table[pos / page_size];
++    const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
++    if (page >= 0) oct_store_row(is_v ? v_oct : k_oct, row, b, t, g);
++    if (host.k_q4 != nullptr) {
++        const long long hrow = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
++        oct_store_row(is_v ? host.v_q4 : host.k_q4, hrow, b, t, g);
++    }
++}
++
++// The prompt path: grid (T, kv_heads, blocks_per_head), K then V; also into the staging pool when given.
++__global__ void kv_append_oct_batch_kernel(uint8_t* __restrict__ k_oct, uint8_t* __restrict__ v_oct,
++                                           const int32_t* __restrict__ table, int64_t pos0,
++                                           const float* __restrict__ K, const float* __restrict__ V, int kv_heads,
++                                           int head_dim, int page_size, int is_v_grid, KvHostPools host,
++                                           KvHostPools stage) {
++    const long long t = blockIdx.x;
++    const long long pos = pos0 + t;
++    const int h = blockIdx.y, b = blockIdx.z, th = threadIdx.x;
++    const bool is_v = is_v_grid != 0;
++    const float x = (is_v ? V : K)[t * (kv_heads * head_dim) + h * head_dim + b * QK_OCT + th];
++    const OctGroup g = oct_group(x);
++    const long long page = (long long) table[pos / page_size];
++    const long long row_id = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
++    if (page >= 0) oct_store_row(is_v ? v_oct : k_oct, (page * kv_heads + h) * page_size + (pos % page_size), b, th, g);
++    if (host.k_q4 != nullptr) oct_store_row(is_v ? host.v_q4 : host.k_q4, row_id, b, th, g);
++    if (stage.k_q4 != nullptr) oct_store_row(is_v ? stage.v_q4 : stage.k_q4, row_id, b, th, g);
++}
++
++// Gather step[kStepWidth] cells into FP16 scratch (the non-fused attention paths).
++__global__ void kv_gather_oct_kernel(const uint8_t* __restrict__ k_oct, const uint8_t* __restrict__ v_oct,
++                                     const int32_t* __restrict__ table, const int32_t* __restrict__ ids,
++                                     const int32_t* __restrict__ step, int kv_heads, int head_dim, int page_size,
++                                     uint16_t* __restrict__ k_scratch, uint16_t* __restrict__ v_scratch) {
++    const long long n_ids = (long long) __ldg(step + kStepWidth);
++    const int bph = head_dim / QK_OCT;
++    const int bytes_per_head = bph * (int) sizeof(block_oct3);
++    const long long total_blocks = n_ids * kv_heads * bph;
++    const long long blk_idx = (long long) blockIdx.x * blockDim.y + threadIdx.y;
++    if (blk_idx >= total_blocks) return;
++
++    const int t = threadIdx.x;
++    const long long id = blk_idx / (kv_heads * bph);
++    const int rem = (int) (blk_idx % (kv_heads * bph));
++    const int h = rem / bph, b = rem % bph;
++    const int cell = ids[id];
++    const long long page = (long long) table[cell / page_size];
++    const long long row = (page * kv_heads + h) * page_size + (cell % page_size);
++    const block_oct3* kb = reinterpret_cast<const block_oct3*>(k_oct + row * bytes_per_head) + b;
++    const block_oct3* vb = reinterpret_cast<const block_oct3*>(v_oct + row * bytes_per_head) + b;
++    const long long dst = ((id * kv_heads + h) * head_dim) + (b * QK_OCT + t);
++    k_scratch[dst] = f16_from_f32(f32_from_f16(kb->d) * oct_level(oct_load_code(kb, t)));
++    v_scratch[dst] = f16_from_f32(f32_from_f16(vb->d) * oct_level(oct_load_code(vb, t)));
++}
++
++void need_256(const QsaShapes& s, const char* what) {
++    if (s.head_dim != 256) {
++        std::fprintf(stderr, "%s: head_dim must be 256 (the Hadamard transform's size)\n", what);
++        std::exit(1);
++    }
++}
++
++}  // namespace
++
++void kv_oct_quantize(const float* src, uint8_t* dst, int64_t n_groups, void* stream) {
++    if (n_groups <= 0) return;
++    kv_oct_quantize_kernel<<<(unsigned) n_groups, 32, 0, (cudaStream_t) stream>>>(src, dst, n_groups);
++    check("quantize launch");
++}
++
++void kv_oct_dequantize(const uint8_t* src, float* dst, int64_t n_groups, void* stream) {
++    if (n_groups <= 0) return;
++    kv_oct_dequantize_kernel<<<(unsigned) n_groups, 32, 0, (cudaStream_t) stream>>>(src, dst, n_groups);
++    check("dequantize launch");
++}
++
++void kv_append_oct_steps(uint8_t* k_oct, uint8_t* v_oct, const int32_t* page_table, const int32_t* step,
++                         int step_stride, int n_steps, const float* kcur, const float* vcur, const QsaShapes& s,
++                         void* stream, const KvHostPools* host) {
++    if (n_steps <= 0) return;
++    need_256(s, "kv_append_oct");
++    const int planes = (v_oct == nullptr || (v_oct == k_oct && vcur == kcur)) ? 1 : 2;
++    const dim3 grid((unsigned) s.n_head_kv, (unsigned) (s.head_dim / QK_OCT), (unsigned) (n_steps * planes));
++    kv_append_oct_kernel<<<grid, 32, 0, (cudaStream_t) stream>>>(
++        k_oct, v_oct, page_table, step, step_stride, planes, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim,
++        (int) s.page_size, host ? *host : KvHostPools{});
++    check("kv_append_oct launch");
++}
++
++void kv_append_oct_step(uint8_t* k_oct, uint8_t* v_oct, const int32_t* page_table, const int32_t* step,
++                        const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
++                        const KvHostPools* host) {
++    kv_append_oct_steps(k_oct, v_oct, page_table, step, 0, 1, kcur, vcur, s, stream, host);
++}
++
++void kv_append_oct(uint8_t* k_oct, uint8_t* v_oct, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,
++                   const float* V, const QsaShapes& s, void* stream, const KvHostPools* host, const KvHostPools* stage) {
++    if (T <= 0) return;
++    need_256(s, "kv_append_oct");
++    const dim3 grid((unsigned) T, (unsigned) s.n_head_kv, (unsigned) (s.head_dim / QK_OCT));
++    cudaStream_t cs = (cudaStream_t) stream;
++    const KvHostPools h = host ? *host : KvHostPools{}, st = stage ? *stage : KvHostPools{};
++    for (int is_v = 0; is_v < 2; ++is_v)
++        kv_append_oct_batch_kernel<<<grid, 32, 0, cs>>>(k_oct, v_oct, page_table, pos0, K, V, (int) s.n_head_kv,
++                                                        (int) s.head_dim, (int) s.page_size, is_v, h, st);
++    check("kv_append_oct batch launch");
++}
++
++void kv_gather_oct_step(const uint8_t* k_oct, const uint8_t* v_oct, const int32_t* page_table, const int32_t* ids,
++                        const int32_t* step, int64_t max_ids, const QsaShapes& s, uint16_t* k_scratch,
++                        uint16_t* v_scratch, void* stream) {
++    if (max_ids <= 0) return;
++    const int bph = (int) (s.head_dim / QK_OCT);
++    const int64_t total_blocks = max_ids * s.n_head_kv * bph;
++    const int rows_per_block = 4;
++    const unsigned nb = (unsigned) ((total_blocks + rows_per_block - 1) / rows_per_block);
++    kv_gather_oct_kernel<<<dim3(nb), dim3(32, rows_per_block), 0, (cudaStream_t) stream>>>(
++        k_oct, v_oct, page_table, ids, step, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size, k_scratch,
++        v_scratch);
++    check("kv_gather_oct launch");
++}
++
++// ---- host reference: the same tree, the same constants ------------------------------------------------
++namespace {
++float tree_sum32(const float* v) {
++    float t[32];
++    for (int i = 0; i < 32; ++i) t[i] = v[i];
++    for (int o = 16; o > 0; o >>= 1)
++        for (int i = 0; i < o; ++i) t[i] += t[i + o];
++    return t[0];
++}
++}  // namespace
++
++void kv_oct_quantize_group_host(const float* x, block_oct3& blk) {
++    float sq[32], xl[32];
++    int codes[32];
++    for (int i = 0; i < 32; ++i) sq[i] = x[i] * x[i];
++    const float sxx = tree_sum32(sq);
++    const float s0 = sxx > 0.0f ? std::sqrt(sxx / (float) QK_OCT) : 0.0f;
++    for (int i = 0; i < 32; ++i) {
++        int c = 0;
++        float level = 0.0f;
++        if (s0 > 0.0f) {
++            const float a = std::fabs(x[i] / s0) * 32.0f;
++            const int m = a < kOctThreshold[0] ? 0 : (a < kOctThreshold[1] ? 1 : (a < kOctThreshold[2] ? 2 : 3));
++            c = m + (x[i] < 0.0f ? 4 : 0);
++            level = (float) kOctLevel[c] * (1.0f / 32.0f);
++        }
++        codes[i] = c;
++        xl[i] = x[i] * level;
++    }
++    const float sxL = tree_sum32(xl);
++    blk.d = f16_from_f32(sxL > 0.0f ? sxx / sxL : 0.0f);
++    uint32_t w[3] = {0u, 0u, 0u};
++    for (int i = 0; i < 32; ++i)
++        for (int b = 0; b < 3; ++b)
++            if ((codes[i] & (1 << b)) != 0) w[b] |= 1u << i;
++    std::memcpy(blk.qs, w, sizeof(w));
++}
++
++void kv_oct_dequantize_group_host(const block_oct3& blk, float* x) {
++    uint32_t w[3];
++    std::memcpy(w, blk.qs, sizeof(w));
++    const float d = f32_from_f16(blk.d);
++    for (int i = 0; i < 32; ++i) {
++        const int code = (int) (((w[0] >> i) & 1u) | (((w[1] >> i) & 1u) << 1) | (((w[2] >> i) & 1u) << 2));
++        x[i] = d * ((float) kOctLevel[code] * (1.0f / 32.0f));
++    }
++}
++
++}  // namespace strata::kernels
+diff --git a/src/kernels/cuda/kv_stream.cu b/src/kernels/cuda/kv_stream.cu
+index 209984b4..cdf85e52 100644
+--- a/src/kernels/cuda/kv_stream.cu
++++ b/src/kernels/cuda/kv_stream.cu
+@@ -1,6 +1,7 @@
+ // src/kernels/cuda/kv_stream.cu - see include/strata/kernels/kv_stream.hpp.
+ #include "strata/kernels/kv_stream.hpp"
+ #include "strata/kernels/kv_q4.hpp"
++#include "strata/kernels/kv_octave.hpp"
+ #include "strata/kernels/kv_q8.hpp"
+ 
+ #include <cuda_runtime.h>
+@@ -40,8 +41,9 @@ Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const
+         r.src[1] = (const uint8_t*) host.k_scale; r.dst[1] = (uint8_t*) slots.k_scale; r.len[1] = scales;
+         r.src[2] = (const uint8_t*) host.v_q4;    r.dst[2] = (uint8_t*) slots.v_q4;    r.len[2] = v;
+         r.n = 3;
+-    } else if (fmt == kKvQ4) {
+-        const int bytes = rows * (int) kv_q4_bytes_per_head((int) s.head_dim);
++    } else if (fmt == kKvQ4 || fmt == kKvOct3) {   // oct3 rides the same two byte runs, at 14-byte blocks
++        const int bytes = rows * (fmt == kKvOct3 ? (int) kv_oct_bytes_per_head((int) s.head_dim)
++                                                 : (int) kv_q4_bytes_per_head((int) s.head_dim));
+         r.src[0] = (const uint8_t*) host.k_q4; r.dst[0] = (uint8_t*) slots.k_q4; r.len[0] = bytes;
+         r.src[1] = (const uint8_t*) host.v_q4; r.dst[1] = (uint8_t*) slots.v_q4; r.len[1] = bytes;
+         r.n = 2;
+@@ -201,6 +203,7 @@ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
+     if (fmt == kKvHybrid)
+         return rows * (uint64_t) s.head_dim + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 +
+                rows * kv_q4_bytes_per_head((int) s.head_dim);
++    if (fmt == kKvOct3) return rows * kv_oct_bytes_per_head((int) s.head_dim) * 2;
+     if (fmt == kKvQ4) return rows * kv_q4_bytes_per_head((int) s.head_dim) * 2;
+     return fmt == kKvInt8 ? rows * (uint64_t) s.head_dim * 2 + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 * 2
+                 : rows * (uint64_t) s.head_dim * 2 * 2;
+diff --git a/src/kernels/cuda/qsa_decode_attn.cu b/src/kernels/cuda/qsa_decode_attn.cu
+index fbbef636..014504ec 100644
+--- a/src/kernels/cuda/qsa_decode_attn.cu
++++ b/src/kernels/cuda/qsa_decode_attn.cu
+@@ -5,6 +5,7 @@
+ #include "strata/core/geometry.hpp"
+ #include "strata/kernels/kv_q8.hpp"
+ #include "strata/kernels/kv_q4.hpp"
++#include "strata/kernels/kv_octave.hpp"
+ #if defined(STRATA_HIP_GFX906)
+ #include "strata/kernels/gfx_arch.hpp"
+ #endif
+@@ -76,8 +77,41 @@ __device__ __forceinline__ void load8_q4(const QsaAttnPools& p, bool value, long
+         for (int k = 0; k < 8; ++k) out[k] = (float) ((int)(bytes[k] >> 4) - 8) * d;
+     }
+ }
++__device__ __forceinline__ void load8_oct(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
++    constexpr int bytes_per_head = (HD / QK_OCT) * sizeof(block_oct3);
++    const int b = d0 / QK_OCT;
++    const int rem = d0 % QK_OCT;
++    const block_oct3* blk = reinterpret_cast<const block_oct3*>((value ? p.v_q4 : p.k_q4) + row * bytes_per_head) + b;
++    const float d = __half2float(__ushort_as_half(blk->d));
++    const uint8_t* qs = blk->qs;
++#pragma unroll
++    for (int k = 0; k < 8; ++k) {
++        const int j = rem + k, by = j >> 3, bi = j & 7;
++        const int code = ((qs[by] >> bi) & 1) | (((qs[4 + by] >> bi) & 1) << 1) | (((qs[8 + by] >> bi) & 1) << 2);
++        out[k] = (float) kOctLevel[code] * (1.0f / 32.0f) * d;
++    }
++}
++/// The exact window's row (kv_exact_window.hpp): the same 8 values as fp16, straight out of the fp16 copy the append
++/// path keeps for the sinks and the newest `tail` cells.
++__device__ __forceinline__ void load8_win(const KvExactWindow& w, bool value, int wrow, int kvh, int d0, float* out) {
++    const uint16_t* base = (value ? w.v : w.k) + (size_t) wrow * (size_t) (w.n_head_kv * w.head_dim) +
++                           (size_t) kvh * w.head_dim + d0;
++    const uint4 raw = *reinterpret_cast<const uint4*>(base);
++    const __half2* h2 = reinterpret_cast<const __half2*>(&raw);
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        const float2 f = __half22float2(h2[j]);
++        out[2 * j] = f.x;
++        out[2 * j + 1] = f.y;
++    }
++}
+ template <int KV_MODE>
+-__device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
++__device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long long row, int d0, float* out,
++                                      int wrow = -1, int kvh = 0) {
++    if (wrow >= 0) {   // the exact window still holds this cell (only ever set when it is present)
++        load8_win(p.win, value, wrow, kvh, d0, out);
++        return;
++    }
+     if constexpr (KV_MODE == 0) load8_f16(p, value, row, d0, out);
+     else if constexpr (KV_MODE == 1) load8_q8(p, value, row, d0, out);
+     else if constexpr (KV_MODE == 3) {
+@@ -85,7 +119,8 @@ __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long lo
+         // reads the Q4_0 pool instead of dereferencing the null v_q (no call site does today; PR review)
+         if (value) load8_q4(p, value, row, d0, out);
+         else load8_q8(p, value, row, d0, out);
+-    } else load8_q4(p, value, row, d0, out);
++    } else if constexpr (KV_MODE == 4) load8_oct(p, value, row, d0, out);   // 3-bit Lloyd-Max blocks
++    else load8_q4(p, value, row, d0, out);
+ }
+ 
+ // Exact-intent score reduce-scatter: the same butterfly pairs as twelve warp_sum calls,
+@@ -138,6 +173,7 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
+     __shared__ __align__(16) float sq[G][HD];     // 12 KB: this KV head's query heads
+     __shared__ float sp[G][CHUNK];                // scores, then probabilities
+     __shared__ long long srow[CHUNK];             // pool row of each cell (page, kv head, slot)
++    __shared__ int wrow[CHUNK];                   // exact window's row of each cell, -1: read the codes
+     const int n_ids = __ldg(step + kStepWidth);
+     const int chunk = blockIdx.x, kvh = blockIdx.y;
+     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+@@ -159,14 +195,22 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
+     }
+     if (t < CHUNK) {
+         long long r = -1;
++        int w = -1;
+         if (t < n_here) {
+             const int cell = ids[c0 + t];
++            // the exact window: a cell the sinks or the newest `tail` still hold in fp16 is read from there.  The
++            // tag is what makes this safe - a row reused by a newer position does not match and stays a miss.
++            if (p.win.present()) {
++                const int wr = kv_window_row(p.win, cell);
++                if (wr >= 0 && __ldg(p.win.tag + wr) == cell) w = wr;
++            }
+             const long long page = (long long) p.page_table[cell / page_size];
+             // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
+             // (score -FLT_MAX, weight 0) instead of being read from before the pool.
+             if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+         }
+         srow[t] = r;
++        wrow[t] = w;
+     }
+     __syncthreads();
+     if constexpr (LANE_CELL) {
+@@ -184,7 +228,7 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
+ #pragma unroll
+             for (int l = 0; l < 32; ++l) {
+                 float k8[8];
+-                load8<KV_MODE>(p, false, srow[c], l * 8, k8);
++                load8<KV_MODE>(p, false, srow[c], l * 8, k8, wrow[c], kvh);
+ #pragma unroll
+                 for (int j = 0; j < HPT; ++j) {
+                     const float4 qa = *reinterpret_cast<const float4*>(&sq[h0 + j][l * 8]);
+@@ -212,7 +256,7 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
+         }
+         if constexpr (REDUCE12) {
+         float k8[8];
+-        load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
++        load8<KV_MODE>(p, false, srow[c], lane * 8, k8, wrow[c], kvh);
+         float part[16];
+ #pragma unroll
+         for (int h = 0; h < G; ++h) {
+@@ -230,7 +274,7 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
+         if ((lane & 1) == 0 && head < G) sp[head][c] = score * scale;
+         } else {
+         float k8[8];
+-        load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
++        load8<KV_MODE>(p, false, srow[c], lane * 8, k8, wrow[c], kvh);
+ #pragma unroll
+         for (int h = 0; h < G; ++h) {
+             const int qflip = QUERY_SWIZZLE ? (lane & 4) : 0;
+@@ -263,11 +307,24 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
+     for (int c = 0; c < n_here; ++c) {
+         if (srow[c] < 0) continue;   // masked above, weight 0
+         float v;
+-        if constexpr (KV_MODE == 0) {
++        if (wrow[c] >= 0) {   // the exact window still holds this cell's value
++            v = __half2float(__ushort_as_half(
++                p.win.v[(size_t) wrow[c] * (size_t) (p.win.n_head_kv * HD) + (size_t) kvh * HD + t]));
++        } else if constexpr (KV_MODE == 0) {
+             v = __half2float(__ushort_as_half(p.v_pool[srow[c] * HD + t]));
+         } else if constexpr (KV_MODE == 1) {
+             const float sc = __half2float(__ushort_as_half(p.v_scale[srow[c] * (HD / KV_Q8_GROUP) + t / KV_Q8_GROUP]));
+             v = (float) p.v_q[srow[c] * HD + t] * sc;
++        } else if constexpr (KV_MODE == 4) {   // oct3: 3-bit Lloyd-Max codes (kv_octave.hpp)
++            constexpr int bytes_per_head = (HD / QK_OCT) * sizeof(block_oct3);
++            const int b = t / QK_OCT;
++            const int rem = t % QK_OCT;
++            const block_oct3* blk = reinterpret_cast<const block_oct3*>(p.v_q4 + srow[c] * bytes_per_head) + b;
++            const float dv = __half2float(__ushort_as_half(blk->d));
++            const uint8_t* qs = blk->qs;
++            const int by = rem >> 3, bi = rem & 7;
++            const int code = ((qs[by] >> bi) & 1) | (((qs[4 + by] >> bi) & 1) << 1) | (((qs[8 + by] >> bi) & 1) << 2);
++            v = (float) kOctLevel[code] * (1.0f / 32.0f) * dv;
+         } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
+             constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+             const int b = t / QK4_0;
+@@ -528,6 +585,16 @@ __device__ __forceinline__ float load_v1(const QsaAttnPools& p, long long row, i
+     } else if constexpr (KV_MODE == 1) {
+         const float sc = __half2float(__ushort_as_half(p.v_scale[row * (HD / KV_Q8_GROUP) + d / KV_Q8_GROUP]));
+         return (float) p.v_q[row * HD + d] * sc;
++    } else if constexpr (KV_MODE == 4) {   // oct3: 3-bit Lloyd-Max codes (kv_octave.hpp)
++        constexpr int bytes_per_head = (HD / QK_OCT) * sizeof(block_oct3);
++        const int b = d / QK_OCT;
++        const int rem = d % QK_OCT;
++        const block_oct3* blk = reinterpret_cast<const block_oct3*>(p.v_q4 + row * bytes_per_head) + b;
++        const float dd = __half2float(__ushort_as_half(blk->d));
++        const uint8_t* qs = blk->qs;
++        const int by = rem >> 3, bi = rem & 7;
++        const int code = ((qs[by] >> bi) & 1) | (((qs[4 + by] >> bi) & 1) << 1) | (((qs[8 + by] >> bi) & 1) << 2);
++        return (float) kOctLevel[code] * (1.0f / 32.0f) * dd;
+     } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
+         constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+         const int b = d / QK4_0;
+@@ -919,6 +986,7 @@ bool lane_cell_attn() {
+ 
+ // 0 fp16, 1 int8, 2 q4_0, 3 int8 K with q4_0 V
+ int attn_kv_mode(const QsaAttnPools& p) {
++    if (p.oct3) return 4;   // k_q4/v_q4 carry 14-byte oct3 blocks, which mode 2 would misread
+     return p.k_q4 != nullptr ? 2 : (p.k_q != nullptr && p.v_q4 != nullptr ? 3 : (p.k_q != nullptr ? 1 : 0));
+ }
+ 
+@@ -947,8 +1015,7 @@ void launch_merge(int v2, const float* part_acc, const float* part_m, const floa
+ // kernel where it is built (the parity harness: never the environment).
+ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                          int64_t cap, const QsaShapes& s, float* scratch, int64_t n_q, cudaStream_t st, int kernel) {
+-    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
+-                        : (pools.k_q != nullptr ? 1 : 0));
++    const int kv_mode = attn_kv_mode(pools);
+     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
+     // per query: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head], all offsets from one stride
+     const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+@@ -1020,7 +1087,14 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
+                                                           scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+     else
+ #endif
+-    if (kv_mode == 3)
++    if (kv_mode == 4) {
++        if (pre) {
++            std::fprintf(stderr, "oct3 KV: the pre-sm_75 attention kernel has no oct3 mode\n");
++            std::exit(1);
++        }
++        attn_chunk_kernel<4><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
++                                                       scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
++    } else if (kv_mode == 3)
+         STRATA_ATTN_CHUNK_SEL(3, pre)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv,
+                                                                 (int) s.page_size, scale, part_acc, part_m, part_l,
+                                                                 n_chunks, (int) cap, stride);
+@@ -1106,6 +1180,10 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const
+     cudaStream_t st = (cudaStream_t) stream;
+ #define STRATA_ATTN_SLOTS(M, LC) attn_chunk_slots_kernel<M, LC><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
+     if (lane_cell) {
++        if (kv_mode == 4) {
++            std::fprintf(stderr, "oct3 KV: the slot-batched attention has no oct3 mode (single session only)\n");
++            std::exit(1);
++        }
+         if (kv_mode == 3) STRATA_ATTN_SLOTS(3, true);
+         else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, true);
+         else if (kv_mode == 1) STRATA_ATTN_SLOTS(1, true);
+@@ -1136,8 +1214,7 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
+         std::fprintf(stderr, "qsa_decode_attn_batch_rows: unsupported geometry or missing buffers\n");
+         std::exit(1);
+     }
+-    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
+-                        : (pools.k_q != nullptr ? 1 : 0));
++    const int kv_mode = attn_kv_mode(pools);
+     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
+     const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+     float* part_acc = scratch;
+@@ -1165,6 +1242,10 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
+     }
+ #define STRATA_ATTN_ROWS(M) attn_chunk_rows_kernel<M><<<grid, THREADS, 0, st>>>(q, rows, ids, steps, (int) s.n_head_kv, \
+         (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
++    if (kv_mode == 4) {
++        std::fprintf(stderr, "oct3 KV: the row-batched attention has no oct3 mode (drop STRATA_BATCH_ATTN_ROWS)\n");
++        std::exit(1);
++    }
+     if (kv_mode == 3) STRATA_ATTN_ROWS(3);
+     else if (kv_mode == 2) STRATA_ATTN_ROWS(2);
+     else if (kv_mode == 1) STRATA_ATTN_ROWS(1);
+@@ -1191,8 +1272,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
+         std::fprintf(stderr, "qsa_decode_attn: unsupported geometry or missing buffers\n");
+         std::exit(1);
+     }
+-    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
+-                        : (pools.k_q != nullptr ? 1 : 0));
++    const int kv_mode = attn_kv_mode(pools);
+     if (kv_mode == 3 ? (!pools.k_scale || !pools.v_q4)
+                      : (kv_mode == 2 ? (!pools.v_q4) : (kv_mode == 1 ? (!pools.v_q || !pools.k_scale || !pools.v_scale)
+                                                                      : (!pools.k_pool || !pools.v_pool)))) {
+diff --git a/src/kernels/cuda/qsa_prompt_attn.cu b/src/kernels/cuda/qsa_prompt_attn.cu
+index 3bdc4ffc..f56bd7f3 100644
+--- a/src/kernels/cuda/qsa_prompt_attn.cu
++++ b/src/kernels/cuda/qsa_prompt_attn.cu
+@@ -2382,6 +2382,7 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
+     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
+         return false;
+     cudaStream_t st = (cudaStream_t) stream;
++    if (pools.oct3) return false;   // oct3 has no prompt-attention mode; the decode kernel mode 4 reads it
+     if (pools.k_q4 != nullptr) {   // Q4_0 K and V (--kv q4_0): mode 4.  STRATA_PROMPT_ATTN_Q4=0: the old kernel (A/B)
+         static const bool q4_off = [] {
+             const char* v = std::getenv("STRATA_PROMPT_ATTN_Q4");
+diff --git a/src/kernels/kv_exact_window_parity.cpp b/src/kernels/kv_exact_window_parity.cpp
+new file mode 100644
+index 00000000..f362bd67
+--- /dev/null
++++ b/src/kernels/kv_exact_window_parity.cpp
+@@ -0,0 +1,155 @@
++// src/kernels/kv_exact_window_parity.cpp - the exact KV window (GPU, synthetic, no model): the sinks stay, the ring
++// evicts in position order, a gather reports hits and misses correctly, and the values come back exactly (the
++// pattern is integer-valued, so fp16 is lossless here and any difference is a bug).
++#include "strata/kernels/kv_exact_window.hpp"
++#include "strata/kernels/kv_stream.hpp"
++#include "strata/kernels/f16_bits.hpp"
++
++#include <cuda_runtime.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++namespace K = strata::kernels;
++
++namespace {
++void ck(cudaError_t e, const char* what) {
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
++        std::exit(1);
++    }
++}
++float pat(int pos, int h, int d) { return (float) (pos * 10 + h * 2 + (d & 1)); }
++}  // namespace
++
++int main() {
++    const K::QsaShapes s = K::qsa_real_shapes();
++    const int layers = 2, sinks = 4, tail = 8, stride = 4;
++    const int heads = (int) s.n_head_kv, hd = (int) s.head_dim;
++    K::KvExactWindow w;
++    w.layers = layers; w.sinks = sinks; w.tail = tail; w.n_head_kv = heads; w.head_dim = hd; w.pos_stride = stride;
++    const size_t rows = (size_t) layers * (sinks + tail);
++    const size_t row_vals = (size_t) heads * hd;
++    ck(cudaMalloc(&w.k, rows * row_vals * 2), "malloc k");
++    ck(cudaMalloc(&w.v, rows * row_vals * 2), "malloc v");
++    ck(cudaMalloc(&w.tag, rows * sizeof(int32_t)), "malloc tag");
++    K::kv_exact_window_init(w, s, layers, sinks, tail, stride, nullptr);
++
++    // append positions 0..19 one cell at a time, layer 0 only (layer 1 stays empty on purpose)
++    const int n_pos = 20;
++    int32_t* d_step = nullptr;
++    float* d_k = nullptr;
++    float* d_v = nullptr;
++    ck(cudaMalloc(&d_step, stride * sizeof(int32_t)), "malloc step");
++    ck(cudaMalloc(&d_k, row_vals * sizeof(float)), "malloc kcur");
++    ck(cudaMalloc(&d_v, row_vals * sizeof(float)), "malloc vcur");
++    std::vector<float> hkv(row_vals);
++    for (int pos = 0; pos < n_pos; ++pos) {
++        std::vector<int32_t> hstep(stride, -7);
++        hstep[K::kStepPos] = pos;
++        for (int h = 0; h < heads; ++h)
++            for (int d = 0; d < hd; ++d) hkv[(size_t) h * hd + d] = pat(pos, h, d);
++        ck(cudaMemcpy(d_step, hstep.data(), stride * sizeof(int32_t), cudaMemcpyHostToDevice), "step");
++        ck(cudaMemcpy(d_k, hkv.data(), row_vals * sizeof(float), cudaMemcpyHostToDevice), "k");
++        ck(cudaMemcpy(d_v, hkv.data(), row_vals * sizeof(float), cudaMemcpyHostToDevice), "v");
++        K::kv_exact_window_append(w, 0, d_step, d_k, d_v, 1, nullptr);
++    }
++    ck(cudaDeviceSynchronize(), "after appends");
++
++    // gather: sinks (0..3), the newest eight (12..19) and two that must miss (11, 99)
++    const int want[] = {0, 1, 2, 3, 12, 13, 14, 15, 16, 17, 18, 19, 11, 99};
++    const int n = (int) (sizeof(want) / sizeof(want[0]));
++    int32_t* d_pos = nullptr;
++    int32_t* d_hit = nullptr;
++    uint16_t* d_ko = nullptr;
++    uint16_t* d_vo = nullptr;
++    ck(cudaMalloc(&d_pos, n * sizeof(int32_t)), "malloc pos");
++    ck(cudaMalloc(&d_hit, n * sizeof(int32_t)), "malloc hit");
++    ck(cudaMalloc(&d_ko, (size_t) n * row_vals * 2), "malloc ko");
++    ck(cudaMalloc(&d_vo, (size_t) n * row_vals * 2), "malloc vo");
++    ck(cudaMemcpy(d_pos, want, n * sizeof(int32_t), cudaMemcpyHostToDevice), "pos");
++    K::kv_exact_window_gather(w, 0, d_pos, n, d_ko, d_vo, d_hit, nullptr);
++    ck(cudaDeviceSynchronize(), "after gather");
++
++    std::vector<int32_t> hit(n);
++    std::vector<uint16_t> ko((size_t) n * row_vals), vo((size_t) n * row_vals);
++    ck(cudaMemcpy(hit.data(), d_hit, n * sizeof(int32_t), cudaMemcpyDeviceToHost), "hit");
++    ck(cudaMemcpy(ko.data(), d_ko, ko.size() * 2, cudaMemcpyDeviceToHost), "ko");
++    ck(cudaMemcpy(vo.data(), d_vo, vo.size() * 2, cudaMemcpyDeviceToHost), "vo");
++
++    int bad = 0;
++    std::printf("pos  expect  hit  values\n");
++    for (int i = 0; i < n; ++i) {
++        const bool expect = want[i] < sinks || (want[i] >= n_pos - tail && want[i] < n_pos);
++        int vbad = 0;
++        if (hit[i]) {
++            for (int h = 0; h < heads; ++h)
++                for (int d = 0; d < hd; ++d) {
++                    const uint16_t want_bits = K::f16_from_f32(pat(want[i], h, d));
++                    if (ko[(size_t) i * row_vals + (size_t) h * hd + d] != want_bits) ++vbad;
++                    if (vo[(size_t) i * row_vals + (size_t) h * hd + d] != want_bits) ++vbad;
++                }
++        }
++        const bool ok = (hit[i] != 0) == expect && vbad == 0;
++        if (!ok) ++bad;
++        std::printf("%3d  %-6s  %-3s  %s\n", want[i], expect ? "hit" : "miss", hit[i] ? "hit" : "miss",
++                    vbad ? "WRONG VALUES" : (ok ? "ok" : "unexpected"));
++    }
++
++    // ---- the prompt path: one contiguous block, positions 0..19 in one call, `end` = 20.  Only the sinks and the
++    // last `tail` cells may land; everything in between can never be in the finished prompt's window.
++    K::KvExactWindow w2;
++    w2.layers = 1; w2.sinks = sinks; w2.tail = tail; w2.n_head_kv = heads; w2.head_dim = hd; w2.pos_stride = stride;
++    ck(cudaMalloc(&w2.k, rows * row_vals * 2), "malloc k2");
++    ck(cudaMalloc(&w2.v, rows * row_vals * 2), "malloc v2");
++    ck(cudaMalloc(&w2.tag, rows * sizeof(int32_t)), "malloc tag2");
++    K::kv_exact_window_init(w2, s, 1, sinks, tail, stride, nullptr);
++    {
++        std::vector<float> blk((size_t) n_pos * row_vals);
++        for (int pos = 0; pos < n_pos; ++pos)
++            for (int h = 0; h < heads; ++h)
++                for (int d = 0; d < hd; ++d) blk[(size_t) pos * row_vals + (size_t) h * hd + d] = pat(pos, h, d);
++        float* d_kb = nullptr;
++        float* d_vb = nullptr;
++        ck(cudaMalloc(&d_kb, blk.size() * 4), "malloc range k");
++        ck(cudaMalloc(&d_vb, blk.size() * 4), "malloc range v");
++        ck(cudaMemcpy(d_kb, blk.data(), blk.size() * 4, cudaMemcpyHostToDevice), "range k");
++        ck(cudaMemcpy(d_vb, blk.data(), blk.size() * 4, cudaMemcpyHostToDevice), "range v");
++        K::kv_exact_window_append_range(w2, 0, 0, n_pos, d_kb, d_vb, n_pos, nullptr);
++        ck(cudaDeviceSynchronize(), "after range append");
++        std::vector<int32_t> all(n_pos);
++        for (int i = 0; i < n_pos; ++i) all[(size_t) i] = i;
++        int32_t* d_all = nullptr;
++        uint16_t* d_ko2 = nullptr;
++        uint16_t* d_vo2 = nullptr;
++        ck(cudaMalloc(&d_all, n_pos * 4), "malloc all");
++        ck(cudaMalloc(&d_ko2, (size_t) n_pos * row_vals * 2), "malloc ko2");
++        ck(cudaMalloc(&d_vo2, (size_t) n_pos * row_vals * 2), "malloc vo2");
++        ck(cudaMemcpy(d_all, all.data(), n_pos * 4, cudaMemcpyHostToDevice), "all");
++        // hit = null: the "gather after the quantized pool" form the engine uses
++        K::kv_exact_window_gather(w2, 0, d_all, n_pos, d_ko2, d_vo2, nullptr, nullptr);
++        ck(cudaDeviceSynchronize(), "after range gather");
++        std::vector<uint16_t> ko2((size_t) n_pos * row_vals);
++        ck(cudaMemcpy(ko2.data(), d_ko2, ko2.size() * 2, cudaMemcpyDeviceToHost), "ko2");
++        int rbad = 0;
++        for (int pos = 0; pos < n_pos; ++pos) {
++            const bool expect = pos < sinks || pos >= n_pos - tail;
++            int vbad = 0;
++            if (expect)
++                for (int h = 0; h < heads; ++h)
++                    for (int d = 0; d < hd; ++d)
++                        if (ko2[(size_t) pos * row_vals + (size_t) h * hd + d] != K::f16_from_f32(pat(pos, h, d))) ++vbad;
++            if (vbad) ++rbad;
++        }
++        std::printf("\nprompt range 0..%d with end=%d: sinks and the last %d cells written, the rest skipped: %s\n",
++                    n_pos - 1, n_pos, tail, rbad ? "WRONG" : "ok");
++        if (rbad) ++bad;
++    }
++
++    const double per_layer = (double) K::kv_exact_window_bytes_per_layer(s, 4, 64);
++    std::printf("\nwindow cost at the real geometry (sinks 4 + tail 64, one layer): %.2f MiB, x12 layers %.1f MiB\n",
++                per_layer / (1024 * 1024), 12 * per_layer / (1024 * 1024));
++    std::printf("%s\n", bad ? "FAIL" : "ok: sinks kept, ring evicts in order, values exact");
++    return bad ? 1 : 0;
++}
+diff --git a/src/kernels/kv_octave_parity.cpp b/src/kernels/kv_octave_parity.cpp
+new file mode 100644
+index 00000000..22a3afd5
+--- /dev/null
++++ b/src/kernels/kv_octave_parity.cpp
+@@ -0,0 +1,218 @@
++// src/kernels/kv_octave_parity.cpp - the 3-bit Lloyd-Max KV format against a host reference (GPU, synthetic,
++// no model): the device bytes must equal the host reference bit for bit, and the error it leaves on rotated
++// vectors is reported next to a 4-bit uniform grid's on the same data.
++#include "strata/kernels/kv_octave.hpp"
++#include "strata/kernels/kv_q4.hpp"
++#include "strata/kernels/kv_stream.hpp"   // KvHostPools
++#include "strata/kernels/f16_bits.hpp"
++
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <vector>
++
++namespace K = strata::kernels;
++
++namespace {
++void ck(cudaError_t e, const char* what) {
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
++        std::exit(1);
++    }
++}
++
++void rel_err(const char* label, const std::vector<float>& a, const std::vector<float>& b, double* mse_out) {
++    double se = 0, sx = 0;
++    for (size_t i = 0; i < a.size(); ++i) {
++        const double d = (double) a[i] - (double) b[i];
++        se += d * d;
++        sx += (double) a[i] * (double) a[i];
++    }
++    const double mse = se / (double) a.size();
++    if (mse_out) *mse_out = mse;
++    std::printf("  %-22s MSE/coord %.6f   rel L2 %.5f\n", label, mse, std::sqrt(se / std::max(1e-30, sx)));
++}
++
++// A 4-bit uniform grid on the same rotated vectors: per-32 amax, q4_0's d = amax/-8 (the codebook q4_0 ships).
++void q4_uniform_ref(const std::vector<float>& x, std::vector<float>& out) {
++    out.assign(x.size(), 0.0f);
++    for (size_t g = 0; g < x.size() / 32; ++g) {
++        const float* p = &x[g * 32];
++        float amax = 0.0f, mval = 0.0f;
++        for (int i = 0; i < 32; ++i)
++            if (std::fabs(p[i]) > amax || (std::fabs(p[i]) == amax && p[i] > mval)) { amax = std::fabs(p[i]); mval = p[i]; }
++        const float d = mval / -8.0f;
++        const float id = d != 0.0f ? 1.0f / d : 0.0f;
++        for (int i = 0; i < 32; ++i) {
++            int q = (int) std::trunc(p[i] * id + 8.5f);
++            q = q < 0 ? 0 : (q > 15 ? 15 : q);
++            out[g * 32 + i] = (float) (q - 8) * d;
++        }
++    }
++}
++}  // namespace
++
++int main() {
++    const int groups = 4096;                       // 131,072 values
++    const size_t n = (size_t) groups * K::QK_OCT;
++    std::mt19937 rng(7);
++    std::normal_distribution<float> gauss(0.0f, 1.0f);
++    std::vector<float> x(n);
++    for (auto& v : x) v = gauss(rng);
++    for (size_t i = 0; i < n; i += 97) x[i] *= 8.0f;   // KV-like outliers
++    std::vector<float> rot(n);
++
++    float* d_x = nullptr;
++    float* d_rot = nullptr;
++    float* d_back = nullptr;
++    float* d_dec = nullptr;
++    uint8_t* d_enc = nullptr;
++    const size_t enc_bytes = (size_t) groups * sizeof(K::block_oct3);
++    ck(cudaMalloc(&d_x, n * 4), "malloc x");
++    ck(cudaMalloc(&d_rot, n * 4), "malloc rot");
++    ck(cudaMalloc(&d_back, n * 4), "malloc back");
++    ck(cudaMalloc(&d_dec, n * 4), "malloc dec");
++    ck(cudaMalloc(&d_enc, enc_bytes), "malloc enc");
++    ck(cudaMemcpy(d_x, x.data(), n * 4, cudaMemcpyHostToDevice), "copy x");
++
++    // ---- 1. device vs host reference, byte for byte -------------------------------------------------
++    K::kv_oct_quantize(d_x, d_enc, groups, nullptr);
++    std::vector<uint8_t> enc(enc_bytes);
++    ck(cudaMemcpy(enc.data(), d_enc, enc_bytes, cudaMemcpyDeviceToHost), "copy enc");
++    int enc_mismatch = 0, dec_mismatch = 0;
++    K::kv_oct_dequantize(d_enc, d_dec, groups, nullptr);
++    std::vector<float> dec(n);
++    ck(cudaMemcpy(dec.data(), d_dec, n * 4, cudaMemcpyDeviceToHost), "copy dec");
++    for (int gi = 0; gi < groups; ++gi) {
++        K::block_oct3 ref{};
++        K::kv_oct_quantize_group_host(&x[(size_t) gi * K::QK_OCT], ref);
++        if (std::memcmp(&ref, &enc[(size_t) gi * sizeof(K::block_oct3)], sizeof(ref)) != 0) ++enc_mismatch;
++        float href[K::QK_OCT];
++        K::kv_oct_dequantize_group_host(ref, href);
++        for (int i = 0; i < K::QK_OCT; ++i)
++            if (std::memcmp(&href[i], &dec[(size_t) gi * K::QK_OCT + i], sizeof(float)) != 0) ++dec_mismatch;
++    }
++    std::printf("host reference: %d/%d groups differ in the packed bytes, %d/%zu dequantized values differ\n",
++                enc_mismatch, groups, dec_mismatch, n);
++
++    // ---- 2. the error on the vectors themselves (unrotated domain) ----------------------------------
++    double mse_oct = 0, mse_q4 = 0;
++    std::vector<float> q4;
++    q4_uniform_ref(x, q4);
++    std::printf("\nunrotated data (MSE is what the format costs, before rotation helps):\n");
++    rel_err("oct3 (3-bit, Lloyd-Max)", x, dec, &mse_oct);
++    rel_err("q4_0 (4-bit, uniform)", x, q4, &mse_q4);
++
++    // ---- 3. what the KV path actually stores: rotate first ------------------------------------------
++    K::fwht256_cuda(d_x, d_rot, (int64_t) (n / 256), nullptr);   // rows of 256 = one head
++    K::kv_oct_quantize(d_rot, d_enc, groups, nullptr);
++    K::kv_oct_dequantize(d_enc, d_dec, groups, nullptr);
++    std::vector<float> rot_host(n), rot_dec(n);
++    ck(cudaMemcpy(rot_host.data(), d_rot, n * 4, cudaMemcpyDeviceToHost), "copy rot");
++    ck(cudaMemcpy(rot_dec.data(), d_dec, n * 4, cudaMemcpyDeviceToHost), "copy rot dec");
++    K::fwht256_cuda(d_dec, d_back, (int64_t) (n / 256), nullptr);   // H is its own inverse
++    std::vector<float> back(n);
++    ck(cudaMemcpy(back.data(), d_back, n * 4, cudaMemcpyDeviceToHost), "copy back");
++
++    std::vector<float> rot4;
++    q4_uniform_ref(rot_host, rot4);
++    std::printf("\nrotated domain (the frame K and V are stored in):\n");
++    double mse_rot = 0, mse_rot4 = 0, mse_trip = 0;
++    rel_err("oct3 (3-bit, Lloyd-Max)", rot_host, rot_dec, &mse_rot);
++    rel_err("q4_0 (4-bit, uniform)", rot_host, rot4, &mse_rot4);
++    std::printf("  oct3 is %.2fx the 4-bit MSE at %.0f%% of its bytes\n", mse_rot / std::max(1e-30, mse_rot4),
++                100.0 * 112.0 / 144.0);
++    rel_err("oct3 full round trip", x, back, &mse_trip);
++
++    // ---- 4. what it costs in bytes ------------------------------------------------------------------
++    const K::QsaShapes s = K::qsa_real_shapes();
++    const uint64_t oct_head = K::kv_oct_bytes_per_head((int) s.head_dim);
++    std::printf("\nbytes: %llu per head per K or V (%d values), %llu per cell (K+V, both KV heads)\n",
++                (unsigned long long) oct_head, (int) s.head_dim, (unsigned long long) K::kv_oct_bytes_per_cell(s));
++    std::printf("       q4_0 144/576, k8v4 528/816, int8 528/1056 -> oct3 is %.0f%% of k8v4's cell\n",
++                100.0 * (double) K::kv_oct_bytes_per_cell(s) / 816.0);
++
++    // ---- 5. engine-shaped storage: page table + host copy, then gather by ids ------------------------
++    int oct_bad = 0;
++    {
++        const int pages = 4, page_size = (int) s.page_size, cells = pages * page_size;
++        const int rows = cells * (int) s.n_head_kv;
++        const int bph = (int) (s.head_dim / K::QK_OCT);
++        const size_t vals = (size_t) rows * s.head_dim;
++        const size_t pool_bytes = (size_t) rows * bph * sizeof(K::block_oct3);
++        std::vector<float> src(vals);
++        for (auto& v : src) v = gauss(rng);
++        float *d_src = nullptr, *d_rot = nullptr, *d_rotv = nullptr;
++        ck(cudaMalloc(&d_src, vals * 4), "m src");
++        ck(cudaMalloc(&d_rot, vals * 4), "m rot");
++        ck(cudaMalloc(&d_rotv, vals * 4), "m rotv");
++        ck(cudaMemcpy(d_src, src.data(), vals * 4, cudaMemcpyHostToDevice), "c");
++        K::fwht256_cuda(d_src, d_rot, (int64_t) rows, nullptr);
++        ck(cudaMemcpy(d_rotv, d_rot, vals * 4, cudaMemcpyDeviceToDevice), "c");
++        std::vector<float> rotv(vals);
++        ck(cudaMemcpy(rotv.data(), d_rot, vals * 4, cudaMemcpyDeviceToHost), "c");
++
++        std::vector<int32_t> tab(pages);
++        for (int pgi = 0; pgi < pages; ++pgi) tab[pgi] = pgi;      // every page resident in its own slot
++        int32_t* d_tab = nullptr;
++        ck(cudaMalloc(&d_tab, pages * 4), "m tab");
++        ck(cudaMemcpy(d_tab, tab.data(), pages * 4, cudaMemcpyHostToDevice), "c tab");
++        uint8_t *d_k = nullptr, *d_v = nullptr, *h_k = nullptr, *h_v = nullptr;
++        ck(cudaMalloc(&d_k, pool_bytes), "m k");
++        ck(cudaMalloc(&d_v, pool_bytes), "m v");
++        ck(cudaMalloc(&h_k, pool_bytes), "m hk");
++        ck(cudaMalloc(&h_v, pool_bytes), "m hv");
++        K::KvHostPools hostp{};
++        hostp.k_q4 = h_k;
++        hostp.v_q4 = h_v;
++        K::kv_append_oct(d_k, d_v, d_tab, 0, cells, d_rot, d_rotv, s, nullptr, &hostp, nullptr);
++        ck(cudaDeviceSynchronize(), "append");
++
++        const int ids[4] = {0, 5, 9, cells - 1};
++        int32_t* d_ids = nullptr;
++        ck(cudaMalloc(&d_ids, sizeof(ids)), "m ids");
++        ck(cudaMemcpy(d_ids, ids, sizeof(ids), cudaMemcpyHostToDevice), "c ids");
++        std::vector<int32_t> step(4, 0);
++        step[K::kStepWidth] = 4;
++        int32_t* d_step = nullptr;
++        ck(cudaMalloc(&d_step, 16), "m step");
++        ck(cudaMemcpy(d_step, step.data(), 16, cudaMemcpyHostToDevice), "c step");
++        const size_t scr = (size_t) 4 * s.n_head_kv * s.head_dim;
++        uint16_t *d_ks = nullptr, *d_vs = nullptr;
++        ck(cudaMalloc(&d_ks, scr * 2), "m ks");
++        ck(cudaMalloc(&d_vs, scr * 2), "m vs");
++        K::kv_gather_oct_step(d_k, d_v, d_tab, d_ids, d_step, 4, s, d_ks, d_vs, nullptr);
++        ck(cudaDeviceSynchronize(), "gather");
++        std::vector<uint16_t> ks(scr), vs(scr);
++        ck(cudaMemcpy(ks.data(), d_ks, scr * 2, cudaMemcpyDeviceToHost), "c ks");
++        ck(cudaMemcpy(vs.data(), d_vs, scr * 2, cudaMemcpyDeviceToHost), "c vs");
++
++        for (int i = 0; i < 4; ++i)
++            for (int h = 0; h < (int) s.n_head_kv; ++h)
++                for (int b = 0; b < bph; ++b) {
++                    K::block_oct3 ref{};
++                    K::kv_oct_quantize_group_host(
++                        &rotv[((size_t) ids[i] * s.n_head_kv + h) * s.head_dim + (size_t) b * K::QK_OCT], ref);
++                    float dec[K::QK_OCT];
++                    K::kv_oct_dequantize_group_host(ref, dec);
++                    for (int t = 0; t < K::QK_OCT; ++t) {
++                        const uint16_t want = K::f16_from_f32(dec[t]);
++                        const size_t at = (size_t) i * s.n_head_kv * s.head_dim + (size_t) h * s.head_dim +
++                                          (size_t) b * K::QK_OCT + t;
++                        if (ks[at] != want) ++oct_bad;
++                        if (vs[at] != want) ++oct_bad;   // the test feeds the same pattern as K and V
++                    }
++                }
++        std::printf("\nengine-shaped storage (4 pages x 4 cells, page table + host copy): %s (%d mismatches)\n",
++                    oct_bad ? "MISMATCH" : "gather == reference", oct_bad);
++    }
++
++    const int bad = (enc_mismatch != 0 || dec_mismatch != 0 || oct_bad != 0);
++    std::printf("\n%s\n", bad ? "FAIL: device and host reference disagree" : "ok: device bytes are the reference's");
++    return bad ? 1 : 0;
++}
+diff --git a/src/kernels/kv_stream_parity.cpp b/src/kernels/kv_stream_parity.cpp
+index 722b7bc1..7c9e7f6b 100644
+--- a/src/kernels/kv_stream_parity.cpp
++++ b/src/kernels/kv_stream_parity.cpp
+@@ -10,6 +10,7 @@
+ //   4. a ring (the MTP drafter's layout) restored from the host copy reads the same values as the resident pool.
+ // INT8, FP16, Q4_0 (PR #21) and hybrid K8V4 pools; K8V4's appends are the engine's folded calls (layer.cpp), its host
+ // copy written through kv_hybrid_k_half / kv_hybrid_v_half.
++#include "strata/kernels/kv_octave.hpp"
+ #include "strata/kernels/kv_q4.hpp"
+ #include "strata/kernels/kv_q8.hpp"
+ #include "strata/kernels/kv_stream.hpp"
+@@ -50,7 +51,9 @@ template <typename T> T* halloc(size_t n) {   // pinned, mapped; returns the dev
+ 
+ struct Pools {   // one K/V pool set of `pages` pages
+     k::KvHostPools p;   // reused as a plain pointer bundle
++    int kind = k::kKvF16;   // alloc() records it: attn() needs the oct3 flag (the pointers cannot say)
+     void alloc(int64_t pages, const k::QsaShapes& s, int fmt, bool host) {
++        kind = fmt;
+         const size_t rows = (size_t) pages * s.n_head_kv * s.page_size;
+         if (fmt == k::kKvHybrid) {
+             const size_t b = rows * k::kv_q4_bytes_per_head((int) s.head_dim);
+@@ -61,6 +64,10 @@ struct Pools {   // one K/V pool set of `pages` pages
+             const size_t b = rows * k::kv_q4_bytes_per_head((int) s.head_dim);
+             p.k_q4 = host ? halloc<uint8_t>(b) : dalloc<uint8_t>(b);
+             p.v_q4 = host ? halloc<uint8_t>(b) : dalloc<uint8_t>(b);
++        } else if (fmt == k::kKvOct3) {   // 14-byte blocks, the same two byte arrays as Q4_0
++            const size_t b = rows * k::kv_oct_bytes_per_head((int) s.head_dim);
++            p.k_q4 = host ? halloc<uint8_t>(b) : dalloc<uint8_t>(b);
++            p.v_q4 = host ? halloc<uint8_t>(b) : dalloc<uint8_t>(b);
+         } else if (fmt == k::kKvInt8) {
+             p.k_q = host ? halloc<int8_t>(rows * s.head_dim) : dalloc<int8_t>(rows * s.head_dim);
+             p.v_q = host ? halloc<int8_t>(rows * s.head_dim) : dalloc<int8_t>(rows * s.head_dim);
+@@ -75,6 +82,7 @@ struct Pools {   // one K/V pool set of `pages` pages
+         k::QsaAttnPools a;
+         a.k_pool = p.k_pool; a.v_pool = p.v_pool; a.k_q = p.k_q; a.v_q = p.v_q; a.k_scale = p.k_scale;
+         a.v_scale = p.v_scale; a.k_q4 = p.k_q4; a.v_q4 = p.v_q4; a.page_table = table;
++        a.oct3 = kind == k::kKvOct3;
+         return a;
+     }
+ };
+@@ -87,7 +95,9 @@ void append(const Pools& pl, const int32_t* table, const int32_t* step, const fl
+         k::kv_append_q8_step(pl.p.k_q, pl.p.k_q, pl.p.k_scale, pl.p.k_scale, table, step, kc, kc, s, nullptr,
+                              host ? &hk : nullptr);
+         k::kv_append_q4_step(pl.p.v_q4, pl.p.v_q4, table, step, vc, vc, s, nullptr, host ? &hv : nullptr);
+-    } else if (fmt == k::kKvQ4) k::kv_append_q4_step(pl.p.k_q4, pl.p.v_q4, table, step, kc, vc, s, nullptr, host);
++    } else if (fmt == k::kKvOct3)
++        k::kv_append_oct_step(pl.p.k_q4, pl.p.v_q4, table, step, kc, vc, s, nullptr, host);
++    else if (fmt == k::kKvQ4) k::kv_append_q4_step(pl.p.k_q4, pl.p.v_q4, table, step, kc, vc, s, nullptr, host);
+     else if (fmt == k::kKvInt8) k::kv_append_q8_step(pl.p.k_q, pl.p.v_q, pl.p.k_scale, pl.p.v_scale, table, step, kc, vc, s, nullptr, host);
+     else k::kv_append_step(pl.p.k_pool, pl.p.v_pool, table, step, kc, vc, s, nullptr, host);
+ }
+@@ -115,7 +125,8 @@ std::vector<int32_t> selection(int64_t n_kv, int64_t width, std::mt19937& rng) {
+ }
+ 
+ bool run(int fmt) {
+-    const char* name = fmt == k::kKvHybrid ? "k8v4" : fmt == k::kKvQ4 ? "q4_0" : fmt == k::kKvInt8 ? "int8" : "fp16";
++    const char* name = fmt == k::kKvHybrid ? "k8v4" : fmt == k::kKvOct3 ? "oct3" : fmt == k::kKvQ4 ? "q4_0"
++                       : fmt == k::kKvInt8 ? "int8" : "fp16";
+     k::QsaShapes s = k::qsa_real_shapes();
+     const int64_t N = 40000, n_blocks = (N + 3) / 4, n_slots = 8 * 516 + 700;   // must evict: slots < blocks
+     const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s), NQ = 8;
+@@ -239,8 +250,8 @@ bool run(int fmt) {
+ 
+ int main() {
+     std::printf("kv_stream_parity: streamed vs resident KV, bitwise\n");
+-    const bool a = run(k::kKvInt8), b = run(k::kKvF16), c = run(k::kKvQ4), d = run(k::kKvHybrid);
+-    if (!a || !b || !c || !d) ++g_fail;
++    const bool a = run(k::kKvInt8), b = run(k::kKvF16), c = run(k::kKvQ4), d = run(k::kKvHybrid), e = run(k::kKvOct3);
++    if (!a || !b || !c || !d || !e) ++g_fail;
+     std::printf(g_fail ? "FAIL\n" : "PASS\n");
+     return g_fail ? 1 : 0;
+ }
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 6cb888e5..82b84419 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -33,6 +33,7 @@
+ #include "strata/kernels/kv_stream.hpp"
+ #include "strata/kernels/cvec.hpp"
+ #include "strata/kernels/kv_q4.hpp"
++#include "strata/kernels/kv_octave.hpp"
+ #include "strata/core/layer.hpp"
+ #include "strata/core/native_dense.hpp"
+ #include "strata/core/native_head.hpp"
+@@ -1017,11 +1018,50 @@ namespace {
+ // STRATA_KV_STAGE_OWN (A/B only): the staging pool gets its own allocation instead of borrowed expert slots, so a
+ // streamed run lends the prompt path exactly the slots a resident one does (a lent expert runs on the CPU, which
+ // rounds differently: without this an A/B compares two expert placements as well as two KV placements)
++// STRATA_KV_DBG=1: staging debug prints (oct3 hang hunt). Each blocking step is followed by a sync, so the last
++// printed line names the step that hung (host-side prints keep coming while the GPU spins otherwise).
++inline char kv_dbg_mode() {
++    static const char v = [] { const char* e = std::getenv("STRATA_KV_DBG"); return e != nullptr ? e[0] : 0; }();
++    return v;
++}
++inline bool kv_dbg() { return kv_dbg_mode() == '1' || kv_dbg_mode() == '2'; }
++
++// A monotonic stamp on every debug line: the gaps between them locate a slow step without changing its timing.
++inline const char* kv_dbg_t() {
++    static const auto t0 = std::chrono::steady_clock::now();
++    static thread_local char b[24];
++    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
++    std::snprintf(b, sizeof b, "+%lldms ", (long long) ms);
++    return b;
++}
++#define KVDBG(...) (std::fprintf(stderr, "dbg %s ", kv_dbg_t()), std::fprintf(stderr, __VA_ARGS__))
++
++// Flight recorder: the step the prompt path is in, read by the stall report. Plain relaxed stores, no sync.
++std::atomic<int> g_kv_phase{0};          // 0 idle, 1 chunk, 2 stage (host->device), 3 append, 4 attention
++std::atomic<long long> g_kv_p0{0}, g_kv_t0{0};
++std::atomic<int> g_kv_T{0}, g_kv_layer{0}, g_kv_qsa{0};
++inline void kv_phase_set(int ph, int64_t p0, int64_t T, int l, int qsa, int64_t t0) {
++    g_kv_phase.store(ph, std::memory_order_relaxed);
++    g_kv_p0.store((long long) p0, std::memory_order_relaxed);
++    g_kv_T.store((int) T, std::memory_order_relaxed);
++    g_kv_layer.store(l, std::memory_order_relaxed);
++    g_kv_qsa.store(qsa, std::memory_order_relaxed);
++    if (t0 >= 0) g_kv_t0.store((long long) t0, std::memory_order_relaxed);
++}
++
++inline void kv_dbg_sync(void* st) {
++    if (kv_dbg_mode() == '2' && st != nullptr) cudaStreamSynchronize((cudaStream_t) st);
++}
+ bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != nullptr; return v; }
+ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
+                 strata::kernels::KvHostPools& st, bool& ok) {
+     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
+     if (q0.kv_mode != 1) return;
++    if (kv_dbg())
++        KVDBG("take_stage: pages=%lld rows=%lld oct=%d q4=%d hybrid=%d ps=%lld hd=%lld nh=%lld\n",
++                     (long long) q0.n_pages, (long long) ((int64_t) q0.n_pages * s.n_head_kv * s.page_size),
++                     (int) q0.kv_oct, (int) q0.kv_q4, (int) q0.kv_hybrid,
++                     (long long) s.page_size, (long long) s.head_dim, (long long) s.n_head_kv);
+     if (stage_own() && o_borrowed.count_only) return;
+     Alloc own;
+     own.owned = o_borrowed.owned;
+@@ -1031,6 +1071,9 @@ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::k
+         st.k_q = o.take<int8_t>(rows * s.head_dim, ok);
+         st.k_scale = o.take<uint16_t>(rows * (s.head_dim / 64), ok);
+         st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
++    } else if (q0.kv_oct) {   // 14-byte oct3 blocks, the same two arrays as Q4_0
++        st.k_q4 = o.take<uint8_t>(rows * strata::kernels::kv_oct_bytes_per_head((int) s.head_dim), ok);
++        st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_oct_bytes_per_head((int) s.head_dim), ok);
+     } else if (q0.kv_q4) {
+         st.k_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+         st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+@@ -1044,8 +1087,9 @@ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::k
+         st.v_pool = o.take<uint16_t>(rows * s.head_dim, ok);
+     }
+ }
+-strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, const int32_t* table) {
++strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, const int32_t* table, bool oct3 = false) {
+     strata::kernels::QsaAttnPools p;
++    p.oct3 = oct3;
+     p.k_pool = h.k_pool; p.v_pool = h.v_pool; p.k_q = h.k_q; p.v_q = h.v_q; p.k_scale = h.k_scale; p.v_scale = h.v_scale;
+     p.k_q4 = h.k_q4; p.v_q4 = h.v_q4;
+     p.page_table = table;
+@@ -1053,6 +1097,18 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
+ }
+ }  // namespace
+ 
++const char* kv_phase_text() {
++    static thread_local char buf[192];
++    static const char* const names[] = {"idle", "chunk", "stage", "append", "attn"};
++    const int ph = g_kv_phase.load(std::memory_order_relaxed);
++    std::snprintf(buf, sizeof buf, "%s p0=%lld T=%d layer=%d qsa=%d attn_t0=%lld",
++                  ph >= 0 && ph <= 4 ? names[ph] : "?",
++                  (long long) g_kv_p0.load(std::memory_order_relaxed), g_kv_T.load(std::memory_order_relaxed),
++                  g_kv_layer.load(std::memory_order_relaxed), g_kv_qsa.load(std::memory_order_relaxed),
++                  (long long) g_kv_t0.load(std::memory_order_relaxed));
++    return buf;
++}
++
+ Prefill::Prefill() : impl_(new Impl) {}
+ Prefill::~Prefill() {
+     clear_taps();
+@@ -2891,7 +2947,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                     err = "prefill: releasing KV staging pool";
+                     return false;
+                 }
+-                strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), state.host,
++                strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table, state.kv_oct), state.host,
+                     core::qsa_kv_format(state), (p0 + s.page_size - 1) / s.page_size, s, m.kv_copy);
+                 if (cudaPeekAtLastError() != cudaSuccess ||
+                     cudaEventRecord(m.kv_ready, m.kv_copy) != cudaSuccess) {
+@@ -3300,6 +3356,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                     rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
+                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
++                    kv_phase_set(1, p0, T, l, qsa_index, -1);
++                    if (kv_dbg())
++                        KVDBG("chunk: p0=%lld T=%lld mode=%d oct=%d qsa=%d layer=%d\n",
++                                     (long long) p0, (long long) T, st.kv_mode, (int) st.kv_oct, qsa_index, l);
+                     const bool staged = st.kv_mode == 1;
+                     if (staged) {
+                         pt.mark(kPfKvStage, cs);
+@@ -3309,9 +3369,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                 return false;
+                             }
+                             kv_pending = -1;
+-                        } else strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
+-                                                            core::qsa_kv_format(st),
+-                                                            (p0 + s.page_size - 1) / s.page_size, s, m.cs);
++                        } else {
++                            kv_phase_set(2, p0, T, l, qsa_index, -1);
++                            if (kv_dbg())
++                                KVDBG("stage: p0=%lld blocks=%lld ps=%lld oct=%d\n", (long long) p0,
++                                             (long long) ((p0 + s.page_size - 1) / s.page_size), (long long) s.page_size,
++                                             (int) st.kv_oct);
++                            strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table, st.kv_oct), st.host,
++                                                        core::qsa_kv_format(st),
++                                                        (p0 + s.page_size - 1) / s.page_size, s, m.cs);
++                            kv_dbg_sync(m.cs);
++                            if (kv_dbg()) KVDBG("stage ok: p0=%lld\n", (long long) p0);
++                        }
+                         pt.mark(kPfQsa, cs);
+                         pf_step("reading the prompt (batched, step sync): the K/V staged from RAM at layer", l);
+                     }
+@@ -3345,7 +3414,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                             strata::kernels::fwht256_inplace_cuda(m.Kc, T * 2, m.cs);
+                             strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
+                         }
+-                        if (st.kv_q4)
++                        if (st.kv_oct) {
++                            kv_phase_set(3, p0, T, l, qsa_index, -1);
++                            if (kv_dbg())
++                                KVDBG("append: p0=%lld T=%lld staged=%d ps=%lld\n", (long long) p0,
++                                             (long long) T, (int) staged, (long long) s.page_size);
++                            strata::kernels::kv_append_oct(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
++                                                           host_w, staged ? &m.stage : nullptr);
++                            // the exact window: the same rotated K/V in fp16 for the sinks and the newest `tail`
++                            // cells of the finished prompt (kv_exact_window.hpp).  Older cells can never be in it.
++                            strata::kernels::kv_exact_window_append_range(st.win, 0, p0, pos0 + n, m.Kc, m.Vc, T, m.cs);
++                            kv_dbg_sync(m.cs);
++                            if (kv_dbg()) KVDBG("append ok: p0=%lld\n", (long long) p0);
++                        } else if (st.kv_q4)
+                             strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
+                                                           host_w, staged ? &m.stage : nullptr);
+                         else
+@@ -3353,7 +3434,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
+                                       host_w, staged ? &m.stage : nullptr);
+                         if (host_by_dma)
+-                            strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host,
++                            strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table, st.kv_oct), st.host,
+                                                                 core::qsa_kv_format(st), p0 / s.page_size,
+                                                                 (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
+                     }
+@@ -3495,7 +3576,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                             }
+                         }
+                     }
+-                    const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
++                    const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table, st.kv_oct)
+                                                                        : core::qsa_attn_pools(st);
+                     pt.mark(kPfQsaAttn, cs);
+                     // perf-review D-1: the whole chunk on tensor cores, one block per (query, KV head), FP32-level
+@@ -3507,9 +3588,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                                                             m.attn, T, m.cs))
+                         for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
+                             const int64_t nb = std::min(m.attn_batch, T - t0);
++                            kv_phase_set(4, p0, T, l, qsa_index, t0);
++                            if (kv_dbg())
++                                KVDBG("attn: p0=%lld t0=%lld nb=%lld\n", (long long) p0,
++                                             (long long) t0, (long long) nb);
+                             strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
+                                                                    m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
+                                                                    s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
++                            kv_dbg_sync(m.cs);
++                            if (kv_dbg()) KVDBG("attn ok: p0=%lld t0=%lld\n", (long long) p0,
++                                                       (long long) t0);
+                         }
+                     if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
+                     pt.mark(kPfQsa, cs);
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 7bafd685..cc5644d4 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -62,6 +62,7 @@
+ #include "strata/kernels/native_rope.hpp"
+ #include "strata/kernels/mrope.hpp"
+ #include "strata/kernels/kv_q4.hpp"
++#include "strata/kernels/kv_octave.hpp"
+ #include "strata/kernels/qsa.hpp"
+ #include "strata/core/native_head.hpp"
+ #include "strata/core/verify.hpp"
+@@ -830,6 +831,10 @@ void usage() {
+                  "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
+                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
+                  "                       (vs int8's 1,056); streams with --kv-resident too\n"
++                 "  --kv oct3            3-bit Lloyd-Max codes, 448 B/cell (55%% of k8v4, 78%% of q4_0), with an\n"
++                 "                       fp16 window (4 sinks + 64 tail cells per layer). Experimental: needs\n"
++                 "                       --prefill 8192 (a 16384-token chunk has hung on gfx1100), quality anchor\n"
++                 "                       is needle 128k 6/6 on this box; gather path only (no fused decode kernel)\n"
+                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
+                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
+                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
+@@ -1457,6 +1462,7 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
+                      "smaller --max-context, or 'Prefer No Sysmem Fallback' for the engine in the NVIDIA control panel "
+                      "(docs/DETAILS.md) leaves room");
+     }
++    std::fprintf(f, "  prefill kv phase: %s\n", strata::prefill::kv_phase_text());
+     for (int pass = 0; pass < 2; ++pass) {
+         if (pass == 1) {
+             std::this_thread::sleep_for(std::chrono::seconds(2));
+@@ -3184,19 +3190,34 @@ int main(int argc, char** argv) {
+         return 2;
+     }
+     if (o.kv == "q4") o.kv = "q4_0";
+-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
+-        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0 or k8v4\n");
++    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4" && o.kv != "oct3") {
++        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0, k8v4 or oct3\n");
+         return 2;
+     }
+     strata::core::qsa_set_kv_int8(o.kv == "int8");
+-    strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
++    // STRATA_KV_OCT=1: 3-bit Lloyd-Max K/V (kv_octave.hpp), 448 B per cell. Opt-in until the exact window and the
++    // quality numbers are in; it reads through the gather path (there is no fused decode-attention variant yet).
++    const char* kv_oct_env = std::getenv("STRATA_KV_OCT");
++    const bool kv_oct_env_on = kv_oct_env != nullptr && kv_oct_env[0] == '1';
++    const bool kv_oct_on = o.kv == "oct3" || kv_oct_env_on;
++    strata::core::qsa_set_kv_oct(kv_oct_on);
++    if (kv_oct_on) {
++        std::fprintf(stderr, "strata generate: %s: 3-bit Lloyd-Max K/V (448 B/cell, gather path; an fp16 window of 4 "
++                             "sinks + 64 tail cells per layer)\n",
++                     o.kv == "oct3" ? "--kv oct3" : "STRATA_KV_OCT=1");
++        if (o.prefill_chunk > 8192)
++            std::fprintf(stderr, "strata generate: --kv oct3 with a prompt chunk of %lld tokens: a chunk of 16384 or "
++                                 "more has hung on gfx1100 (a staging-path stall); use --prefill 8192 while that is open\n",
++                         (long long) o.prefill_chunk);
++    }
++    strata::core::qsa_set_kv_q4(o.kv == "q4_0" && !kv_oct_on);   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
+     // STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation --kv q4_0 already uses. Opt-in: first-token KL to
+     // fp16 K/V improved on an NVFP4 pack (0.0066 -> 0.0051) but not on IQ2_XS (0.0022 -> 0.0054)
+     const char* kv_rot = std::getenv("STRATA_KV_ROT");
+     strata::core::qsa_set_kv_int8_rotate(kv_rot != nullptr && kv_rot[0] == '1');
+     if (kv_rot != nullptr && kv_rot[0] == '1' && o.kv == "int8")
+         std::fprintf(stderr, "strata generate: STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation (opt-in)\n");
+-    strata::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
++    strata::core::qsa_set_kv_hybrid(o.kv == "k8v4" && !kv_oct_on);   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
+     if (o.kv_resident < 0) {
+         std::fprintf(stderr, "strata generate: --kv-resident must be >= 0\n");
+         return 2;
+@@ -5225,6 +5246,17 @@ int main(int argc, char** argv) {
+                                  "%.2f GiB of pinned RAM\n",
+                          (long long) (ss.qsa_states[ss.qsa_primary()].n_slots * 4),
+                          (long long) o.max_context, (double) strata::core::qsa_kv_host_bytes() / 1073741824.0);
++        {   // --kv oct3: the exact window this session actually sized (kv_exact_window.hpp), so the log says whether
++            // the recent cells are served in fp16 or only as 3-bit codes
++            int ws = 0, wt = 0;
++            strata::core::qsa_window_sizes(ws, wt);
++            if (ws + wt > 0)
++                std::fprintf(stderr, "strata generate: KV window: the first %d and the newest %d cells of every QSA layer "
++                                     "in fp16 (%.1f MiB over %d layers)\n", ws, wt,
++                             (double) strata::kernels::kv_exact_window_bytes_per_layer(
++                                 strata::core::qsa_shapes(g), ws, wt) * (double) g.n_qsa_layers() / 1048576.0,
++                             (int) g.n_qsa_layers());
++        }
+         // the PLE block above built everything but the history, which session_init has just carved
+         ss.ple.hist = ss.ple_hist;
+         // (#167) generate mode starts from an empty sequence, and nothing else zeroes this state before the prompt
+@@ -9438,6 +9470,7 @@ int main(int argc, char** argv) {
+                 c.backend = "cuda";
+ #endif
+                 c.kv = o.kv;
++                if (const char* oct = std::getenv("STRATA_KV_OCT"); oct != nullptr && oct[0] == 49) c.kv += "+oct3";
+                 c.max_context = o.max_context;
+                 c.kv_resident = o.kv_resident;
+                 c.mtp_window = o.mtp.empty() ? -1 : o.mtp_window;
+@@ -15306,7 +15339,10 @@ int main(int argc, char** argv) {
+                 auto kv_arrays = [&](const strata::core::QsaState& st) {
+                     const bool h = st.kv_mode != 0;
+                     std::vector<std::pair<const void*, int64_t>> a;
+-                    if (st.kv_q4) {
++                    if (st.kv_oct) {
++                        const int64_t ob = (int64_t) strata::kernels::kv_oct_bytes_per_head((int) qs.head_dim);
++                        a = {{h ? st.host.k_q4 : st.k_q4, ob}, {h ? st.host.v_q4 : st.v_q4, ob}};
++                    } else if (st.kv_q4) {
+                         const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
+                         a = {{h ? st.host.k_q4 : st.k_q4, q4b}, {h ? st.host.v_q4 : st.v_q4, q4b}};
+                     } else if (st.kv_hybrid) {
+diff --git a/tools/quant_quality.py b/tools/quant_quality.py
+index 10065e3a..4e59e9f3 100644
+--- a/tools/quant_quality.py
++++ b/tools/quant_quality.py
+@@ -81,7 +81,7 @@ def mem_available_gb() -> float:
+     return float("inf")
+ 
+ 
+-def engine_args(cfg: dict, gpu_experts, seg_tokens: int) -> list[str]:
++def engine_args(cfg: dict, gpu_experts, seg_tokens: int, kv_format: str = "fp16") -> list[str]:
+     base, out, i = list(cfg["args"]), [], 0
+     while i < len(base):
+         x = base[i]
+@@ -94,6 +94,7 @@ def engine_args(cfg: dict, gpu_experts, seg_tokens: int) -> list[str]:
+         out.append(x)
+         i += 1
+     fixed = list(FIXED)
++    fixed[fixed.index("--kv") + 1] = kv_format   # the yardstick's default is fp16; a KV format can be measured too
+     if gpu_experts:
+         fixed[1] = gpu_experts if isinstance(gpu_experts, str) else "1500"
+     return [cfg["exe"], "--serve", *out, *fixed, "--max-context", str(seg_tokens + 512),
+@@ -119,7 +120,7 @@ def cmd_run(a) -> int:
+     env["STRATA_LOGPOS_TOPK"] = str(TOPK)
+     if mem_available_gb() < a.min_free_gb:
+         raise SystemExit(f"only {mem_available_gb():.0f} GB available (< {a.min_free_gb}): not starting an engine")
+-    args = engine_args(cfg, a.gpu_experts, st["seg_tokens"])
++    args = engine_args(cfg, a.gpu_experts, st["seg_tokens"], a.kv_format)
+     if a.wrap:
+         args = a.wrap.split() + args
+     errf = open(str(out) + ".stderr.txt", "w")
+@@ -194,7 +195,7 @@ def cmd_prompt(a) -> int:
+     env["STRATA_DUMP_FIRST_LOGITS"] = str(out / "first")
+     if mem_available_gb() < a.min_free_gb:
+         raise SystemExit(f"only {mem_available_gb():.0f} GB available (< {a.min_free_gb}): not starting an engine")
+-    args = engine_args(cfg, a.gpu_experts, max(PROMPT_LENS))
++    args = engine_args(cfg, a.gpu_experts, max(PROMPT_LENS), a.kv_format)
+     k = args.index("--short-read")
+     del args[k:k + 2]                      # the default (64): these prompts take the batched prompt path
+     k = args.index("--prefill")
+@@ -353,6 +354,7 @@ def main() -> int:
+     p.add_argument("--env", action="append")
+     p.add_argument("--gpu-experts", nargs="?", const=True, default=False,
+                    help="--expert-cache 1500 (or the N given, e.g. auto) instead of one slot (the experts on the GPU kernels)")
++    p.add_argument("--kv-format", default="fp16", help="the K/V format (default fp16; e.g. oct3, k8v4)")
+     p.add_argument("--min-free-gb", type=float, default=16)
+     p.add_argument("--wrap", help="a command prefix for the engine, e.g. 'systemd-run --user --scope -p MemoryMax=200G'")
+     p = sub.add_parser("prompt", help="the batched prompt path's next-token logits after 20 prompts (a directory)")
+@@ -361,6 +363,7 @@ def main() -> int:
+     p.add_argument("--ids", default=str(SET_DIR / "set.ids.json"))
+     p.add_argument("--env", action="append")
+     p.add_argument("--gpu-experts", action="store_true")
++    p.add_argument("--kv-format", default="fp16")
+     p.add_argument("--min-free-gb", type=float, default=16)
+     p.add_argument("--wrap")
+     p = sub.add_parser("compare")

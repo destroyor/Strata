@@ -1,0 +1,26 @@
+prefill+first: 31.9 s (213730 chars)
+  Summarise section 3 of this    rep0   82.1 tok/s   30.18 ms/fwd  acc  54.0%  prompt_n 7
+  Summarise section 3 of this    rep1   80.4 tok/s   29.54 ms/fwd  acc  52.8%  prompt_n 7
+  Summarise section 3 of this    rep2   81.0 tok/s   29.40 ms/fwd  acc  54.3%  prompt_n 7
+  List the three claims about    rep0   94.9 tok/s   34.10 ms/fwd  acc  64.0%  prompt_n 8527
+  List the three claims about    rep1  103.4 tok/s   33.76 ms/fwd  acc  70.6%  prompt_n 7
+  List the three claims about    rep2  108.7 tok/s   33.32 ms/fwd  acc  72.4%  prompt_n 7
+  What does the text say about   rep0  101.8 tok/s   34.38 ms/fwd  acc  72.6%  prompt_n 8527
+  What does the text say about   rep1  110.9 tok/s   31.56 ms/fwd  acc  71.4%  prompt_n 7
+  What does the text say about   rep2  112.7 tok/s   31.06 ms/fwd  acc  72.6%  prompt_n 7
+  Explain the verification win   rep0   35.9 tok/s   65.97 ms/fwd  acc  54.4%  prompt_n 8527
+  Explain the verification win   rep1   58.1 tok/s   42.91 ms/fwd  acc  56.7%  prompt_n 7
+  Explain the verification win   rep2   62.4 tok/s   38.46 ms/fwd  acc  52.6%  prompt_n 7
+  Which sentence is the most t   rep0   46.0 tok/s   58.67 ms/fwd  acc  68.7%  prompt_n 8527
+  Which sentence is the most t   rep1   53.5 tok/s   48.26 ms/fwd  acc  65.0%  prompt_n 7
+  Which sentence is the most t   rep2   73.4 tok/s   36.31 ms/fwd  acc  65.4%  prompt_n 7
+  Continue with more technical   rep0   48.8 tok/s   43.19 ms/fwd  acc  56.7%  prompt_n 8526
+  Continue with more technical   rep1   55.9 tok/s   38.16 ms/fwd  acc  58.3%  prompt_n 7
+  Continue with more technical   rep2   43.3 tok/s   49.83 ms/fwd  acc  57.9%  prompt_n 7
+  Give a short outline of the    rep0   51.7 tok/s   57.99 ms/fwd  acc  68.8%  prompt_n 8525
+  Give a short outline of the    rep1   75.1 tok/s   37.61 ms/fwd  acc  64.2%  prompt_n 7
+  Give a short outline of the    rep2   91.2 tok/s   30.50 ms/fwd  acc  62.8%  prompt_n 7
+  What trade-off does speculat   rep0   59.9 tok/s   45.11 ms/fwd  acc  63.0%  prompt_n 8526
+  What trade-off does speculat   rep1   66.9 tok/s   39.29 ms/fwd  acc  62.3%  prompt_n 7
+  What trade-off does speculat   rep2   79.3 tok/s   31.84 ms/fwd  acc  63.0%  prompt_n 7
+{"label": "p64K2", "chars": 213000, "n": 16, "tok_s_med": 77.2, "tok_s_min": 43.3, "tok_s_max": 112.7, "ms_fwd_med": 35.04, "acc_med": 62.9, "cache_misses": 0}

@@ -1,0 +1,223 @@
+diff --git a/src/kernels/cuda/native_bf16.cu b/src/kernels/cuda/native_bf16.cu
+index ff6c439e..29a4fa11 100644
+--- a/src/kernels/cuda/native_bf16.cu
++++ b/src/kernels/cuda/native_bf16.cu
+@@ -229,10 +229,10 @@ __global__ void bf16_f32_mmvf_rows_kernel(const float* __restrict__ x, int64_t l
+                     if (k < n_tok) y[(size_t) k * ldy + o0 + r] = acc[r][k];
+ }
+ 
+-template <int B>
++template <int B, int RPBv = 4>
+ void launch_rows(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out, int n_tok,
+                  cudaStream_t st, const uint16_t* w_aux = nullptr, float* y_aux = nullptr, int64_t ldy_aux = 0) {
+-    constexpr int RPB = 4;
++    constexpr int RPB = RPBv;
+     const unsigned nb = (unsigned) ((n_out + RPB - 1) / RPB);
+     static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
+     if (w_aux != nullptr) {   // S26 STRATA_LFUSE: + one aux row block
+@@ -252,6 +252,37 @@ void launch_rows(const float* x, int64_t ldx, const uint16_t* w, float* y, int64
+     else bf16_f32_mmvf_rows_kernel<B, 8, RPB><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
+ }
+ 
++// S27: rows per block for the multi-row bf16 GEMV. Every output row re-reads the whole activation vector, so R
++// rows per block cut that L2 traffic R-fold - but the block count falls R-fold too, and a 320-row projection
++// (the HC down) is already at 3.3 blocks per SM. Which way it goes is a measurement: STRATA_MMVF_RPB (4|8|16).
++int mmvf_block_size(int64_t n_in);
++
++int mmvf_rpb() {
++    static const int v = [] {
++        const char* v = std::getenv("STRATA_MMVF_RPB");
++        const int r = v != nullptr ? std::atoi(v) : 4;
++        return (r == 8 || r == 16) ? r : 4;
++    }();
++    return v;
++}
++
++void launch_rows_bs(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out,
++                    int n_tok, cudaStream_t st, const uint16_t* w_aux, float* y_aux, int64_t ldy_aux) {
++#define STRATA_MMVF_BS(N)                                                                                       \
++    case N:                                                                                                     \
++        switch (mmvf_rpb()) {                                                                                   \
++            case 8: launch_rows<N, 8>(x, ldx, w, y, ldy, n_in, n_out, n_tok, st, w_aux, y_aux, ldy_aux); break;   \
++            case 16: launch_rows<N, 16>(x, ldx, w, y, ldy, n_in, n_out, n_tok, st, w_aux, y_aux, ldy_aux); break; \
++            default: launch_rows<N, 4>(x, ldx, w, y, ldy, n_in, n_out, n_tok, st, w_aux, y_aux, ldy_aux); break;  \
++        }                                                                                                       \
++        break
++    switch (mmvf_block_size(n_in)) {
++        STRATA_MMVF_BS(32); STRATA_MMVF_BS(64); STRATA_MMVF_BS(96); STRATA_MMVF_BS(128);
++        STRATA_MMVF_BS(160); STRATA_MMVF_BS(192); STRATA_MMVF_BS(224); STRATA_MMVF_BS(256);
++    }
++#undef STRATA_MMVF_BS
++}
++
+ int mmvf_block_size(int64_t n_in) {
+     int best = 32;
+     int64_t best_iterations = (n_in + 63) / 64;
+@@ -277,16 +308,7 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t*
+         return false;
+     const cudaStream_t st = (cudaStream_t) stream;
+     const int ni = (int) n_in, no = (int) n_out;
+-    switch (mmvf_block_size(n_in)) {
+-        case 32: launch_rows<32>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+-        case 64: launch_rows<64>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+-        case 96: launch_rows<96>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+-        case 128: launch_rows<128>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+-        case 160: launch_rows<160>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+-        case 192: launch_rows<192>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+-        case 224: launch_rows<224>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+-        default: launch_rows<256>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+-    }
++    launch_rows_bs(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux);
+     const cudaError_t result = cudaGetLastError();
+     if (result != cudaSuccess)
+         throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi_aux launch: ") + cudaGetErrorString(result));
+@@ -303,16 +325,7 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
+     static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
+     if (rows && n_out >= 64 && n_tok <= 8) {   // (the opt-in rows kernels hold 8 columns: a wider window takes the switch below)
+         const int ni = (int) n_in, no = (int) n_out;
+-        switch (mmvf_block_size(n_in)) {
+-            case 32: launch_rows<32>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
+-            case 64: launch_rows<64>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
+-            case 96: launch_rows<96>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
+-            case 128: launch_rows<128>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
+-            case 160: launch_rows<160>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
+-            case 192: launch_rows<192>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
+-            case 224: launch_rows<224>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
+-            default: launch_rows<256>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
+-        }
++        launch_rows_bs(x, ldx, w, y, ldy, ni, no, n_tok, st, nullptr, nullptr, 0);
+         const cudaError_t result = cudaGetLastError();
+         if (result != cudaSuccess)
+             throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi launch: ") + cudaGetErrorString(result));
+diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
+index 0f2bdf7d..88232aad 100644
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -1363,6 +1363,29 @@ int dev_class() {   // 1 = gfx12, 2 = sm_86, 0 = the rest; per device
+     }
+     return cls[dev] - 1;
+ }
++// gfx1100 (RX 7900 XTX), the missing row for the table above: q8_gemv_bench at 6 columns (the verify window),
++// 3 passes x 300 iterations, one row beats two on every shape measured -- qkv 2560->10240 598 -> 647 GB/s,
++// gate 2560->6144 500 -> 603, out 6144->2560 638 -> 674, q 2560->12288 619 -> 663, k/v 2560->512 247 -> 298,
++// HC down 10240->320 397 -> 548, shared gate/up 2560->640 301 -> 353 (HC up 320->10240 and shared down
++// 640->2560 have fewer than BPI k-blocks and never reach this path). The head (2560->248320) is the one loss:
++// 721 -> 693 GB/s at 6 columns, hence the n_out cap. Same bits: a row's partial sums and their reduction do
++// not depend on ROWS. End to end on the engine: ms/forward 23.355 -> 23.15, identical sha_set.
++bool q8_0_rows1_gfx1100() {
++    static const bool v = [] {
++#if defined(__HIPCC__)
++        int dev = 0;
++        cudaDeviceProp p;
++        if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;
++        return strata::kernels::gfx_arch_is(p.gcnArchName, "gfx1100") ||
++               strata::kernels::gfx_arch_is(p.gcnArchName, "gfx1101") ||
++               strata::kernels::gfx_arch_is(p.gcnArchName, "gfx1102");
++#else
++        return false;
++#endif
++    }();
++    return v;
++}
++
+ template<typename F>
+ bool q8_0_rows1(int n_in, int n_out) {
+     if constexpr (!std::is_same_v<F, SmallTraits<Q80Block, 8>>) {
+@@ -1374,6 +1397,7 @@ bool q8_0_rows1(int n_in, int n_out) {
+             return v == nullptr || v[0] == '\0' ? -1 : v[0] != '0';
+         }();
+         if (env == 0) return false;
++        if (q8_0_rows1_gfx1100() && n_out <= 65536) return true;   // measured; the head is over the cap
+         const int c = dev_class();
+         return (c == 1 && n_in <= 4096 && n_out >= 4096) || (c == 2 && n_out >= 2048);
+     }
+@@ -1542,6 +1566,21 @@ bool b6_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in
+     }
+ }
+ 
++// S27 (gfx1100): 1 or 2 warps per block for a row that one 4-warp iteration cannot fill. 0 = the default block.
++template <typename F>
++int mmvq_smallk_nw(int n_in) {
++    if constexpr (!std::is_same_v<F, SmallTraits<Q80Block, 8>>) {
++        (void) n_in;
++        return 0;
++    } else {
++        static const int nw = [] {
++            const char* v = std::getenv("STRATA_MMVQ_SMALLK_NW");
++            return v != nullptr ? std::atoi(v) : 0;   // opt-in: HCs up 182 -> 345 GB/s at 6 cols, but not bitwise
++        }();
++        return (nw == 1 || nw == 2) && n_in / F::DIV < F::BPI ? nw : 0;
++    }
++}
++
+ template<typename F, int NCOLS>
+ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
+     const auto* w = static_cast<const typename F::Block*>(weights);
+@@ -1558,6 +1597,17 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
+     // the PAIR arguments, unused here (launch_pdl passes every parameter)
+     const typename F::Block* const no_w2 = nullptr;
+     float* const no_y2 = nullptr;
++    // S27: a row with fewer k-blocks than one iteration covers (n_in < 1024 for Q8_0) leaves most of the block
++    // idle, because lanes are indexed by k-block and not by row (n_in=320: 10 of 32 block slots used). A narrower
++    // block covers 8 or 16 blocks per iteration and keeps more lanes busy. Not bitwise the 4-warp block (the
++    // cross-warp reduction is gone), so it stays behind STRATA_MMVQ_SMALLK_NW=1|2.
++    if (const int nw = mmvq_smallk_nw<F>(n_in)) {
++        if (nw == 1)
++            launch_pdl(native_mmvq_multi_kernel<F, NCOLS, 1, 1, false, false>, dim3(unsigned(n_out)), dim3(WARP, 1), 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
++        else
++            launch_pdl(native_mmvq_multi_kernel<F, NCOLS, 2, 1, false, false>, dim3(unsigned(n_out)), dim3(WARP, 2), 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
++        return;
++    }
+     // #783 PR-h (stuchapin909): two rows per block for every K, not only small K - each row keeps its own partial sums and
+     // reduction, so a row's result does not depend on its neighbour; STRATA_NO_MMVQ_ROWS2=1 keeps one row for large K
+     static const bool rows1 = [] {
+diff --git a/src/kernels/q8_gemv_bench.cpp b/src/kernels/q8_gemv_bench.cpp
+index 88e24bab..b8623bc5 100644
+--- a/src/kernels/q8_gemv_bench.cpp
++++ b/src/kernels/q8_gemv_bench.cpp
+@@ -47,11 +47,13 @@ int main(int argc, char** argv) {
+     std::vector<int> cols = {1, 2, 3, 4, 6};
+     int iters = 50;
+     double bw = 0;
++    int max_mb = 512;
+     for (int i = 1; i < argc; ++i) {
+         const std::string a = argv[i];
+         if (a == "--cols" && i + 1 < argc) cols = ints(argv[++i]);
+         else if (a == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
+         else if (a == "--bw" && i + 1 < argc) bw = std::atof(argv[++i]);
++        else if (a == "--max-mb" && i + 1 < argc) max_mb = std::atoi(argv[++i]);
+     }
+     cudaDeviceProp prop;
+     ck(cudaGetDeviceProperties(&prop, 0), "props");
+@@ -59,7 +61,12 @@ int main(int argc, char** argv) {
+     std::mt19937 rng(7);
+     for (const Shape& s : SHAPES) {
+         const size_t bytes = (size_t) s.n_out * (s.n_in / 32) * 34;
+-        const int copies = (int) std::max<size_t>(1, std::min<size_t>(16, ((size_t) 512 << 20) / bytes));
++        const size_t budget = (size_t) max_mb << 20;
++        if (bytes > budget) {   // the engine holds the card; a single matrix over the budget is skipped, not fatal
++            std::printf("\n%s: %.2f MB skipped (one copy exceeds --max-mb %d)\n", s.what, bytes / 1e6, max_mb);
++            continue;
++        }
++        const int copies = (int) std::max<size_t>(1, std::min<size_t>(16, budget / bytes));
+         std::vector<uint8_t> host(bytes);
+         for (size_t b = 0; b < bytes; b += 34) {   // fp16 scale 0.01 (0x211f), then random int8 weights
+             host[b] = 0x1f;
+@@ -96,8 +103,15 @@ int main(int argc, char** argv) {
+             float ms = 0;
+             cudaEventElapsedTime(&ms, e0, e1);
+             const double us = 1000.0 * ms / iters, gbs = bytes / (us * 1e3);
+-            std::printf("  %d col%s: %8.1f us  %7.1f GB/s%s\n", c, c == 1 ? " " : "s", us, gbs,
+-                        bw > 0 ? (" = " + std::to_string((int) (100 * gbs / bw + 0.5)) + "% of bw").c_str() : "");
++            // correctness: the output's checksum, so two dispatch paths can be compared numerically
++            std::vector<float> yh((size_t) s.n_out * c);
++            ck(cudaMemcpy(yh.data(), y, yh.size() * 4, cudaMemcpyDeviceToHost), "y back");
++            double sum = 0;
++            float mx = 0;
++            for (float v : yh) { sum += v; mx = std::max(mx, std::fabs(v)); }
++            std::printf("  %d col%s: %8.1f us  %7.1f GB/s%s   [sum %.6f max %.6f]\n", c, c == 1 ? " " : "s", us, gbs,
++                        bw > 0 ? (" = " + std::to_string((int) (100 * gbs / bw + 0.5)) + "% of bw").c_str() : "",
++                        sum, mx);
+         }
+         for (auto p : w) cudaFree(p);
+         cudaFree(x);

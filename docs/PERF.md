@@ -135,6 +135,7 @@ both sides).
 
 The deployed service, measured through its own API on cold prompts (no cache reuse): 1,971 / 2,010 / 2,012 tok/s at
 35,946 tokens (the first request of a fresh engine 1,529, library warm-up), and 2,172 / 2,241 tok/s at 109,281 tokens.
+Needles on the same service: 96K and 128K at depth 50 both found, 2 of 2 (`perf/raw/needles-deployed.json`).
 
 Where the prefill comes from, switch group by switch group: the prompt fusion/GEMM/CPU-share group is +13%, the GDN
 chunked recurrence and the staging-ring/auto-chunk group another +6%, the matrix-core block scorer +16% at 96K (and

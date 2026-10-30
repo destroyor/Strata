@@ -125,16 +125,21 @@ config (`--kv oct3 --kv-resident 65536 --prefill auto:32768 --spec 5 --spec-min-
 | + `STRATA_SPEC_CUM=0.4` | 2108 | 2008 | 93.05 / 93.55 |
 | + `HIP_WMMA` | 2090 | 1928 | - |
 | + GDN / `PF_F16` / `PREFILL_AUTO_MAX` / `STAGER_RING` (the full set) | 2243 | 1979 | - |
-| **deployed: full set + `SPEC_CUM=0.4`** | **2243** | **1979** | **95.60** (0 stalls, `perf/raw/tps2-prod-deployed.txt`) |
+| + `SELECT_WMMA` (QSA block scorer on matrix cores) | **2280** | **2304** | - |
+| **deployed: full set + `SPEC_CUM=0.4` + `SELECT_WMMA`** | **2280** | **2304** | **95.60** (0 stalls, `perf/raw/tps2-prod-deployed.txt`) |
 
-The deployed service, measured through its own API on cold 35,946-token prompts (no cache reuse):
-1,971 / 2,010 / 2,012 tok/s (`strata serve: prompt 35946 tokens = 0 reused + 35946 read in ...`), the first request
-of a fresh engine 1,529 tok/s (library warm-up).
+`SELECT_WMMA` is the long-context half of the prefill win: +1.6% at 32K, **+16.4% at 96K** (the block scorer's work
+grows with the context), and its selected ids are identical to the warp scorer's on this model - 29,995 positions over
+five 6,000-token segments, top-1 100.00%, KL 0.00000 (`/tmp/qqk6-base.tsv` against `qqk6-sel.tsv`, full switch set on
+both sides).
+
+The deployed service, measured through its own API on cold prompts (no cache reuse): 1,971 / 2,010 / 2,012 tok/s at
+35,946 tokens (the first request of a fresh engine 1,529, library warm-up), and 2,172 / 2,241 tok/s at 109,281 tokens.
 
 Where the prefill comes from, switch group by switch group: the prompt fusion/GEMM/CPU-share group is +13%, the GDN
-chunked recurrence and the staging-ring/auto-chunk group another +6%, and `HIP_WMMA` (the prompt attention on matrix
-cores) nothing measurable on this model - the log does confirm it engages
-(`strata: STRATA_HIP_WMMA: the prompt attention on matrix cores on (gfx1100)`).
+chunked recurrence and the staging-ring/auto-chunk group another +6%, the matrix-core block scorer +16% at 96K (and
++1.6% at 32K), and `HIP_WMMA` (the prompt attention on matrix cores) nothing measurable on this model - the log does
+confirm it engages (`strata: STRATA_HIP_WMMA: the prompt attention on matrix cores on (gfx1100)`).
 
 **One crash, understood**: a run with `--stats` stalled at the first prompt chunk's layer 0, and the engine's own
 watchdog aborted it 60 s later (`Signal 6 (ABRT) si_code: SI_TKILL`, thread `strata-watchdog`; the serve log says

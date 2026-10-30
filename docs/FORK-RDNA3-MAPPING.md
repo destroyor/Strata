@@ -48,25 +48,28 @@ STRATA_VERIFY_QDEDUP=1 STRATA_KV_HOST_DMA=1 STRATA_PF_FUSED=1 STRATA_PF_GEMM=1 \
 STRATA_PF_PAD=1 STRATA_PF_HCDOWN=1
 ```
 
-**Deployed on 2026-10-30** as the production unit's environment (engine 0.1.54 from this repo), with one addition the
-forum's list has and this engine implements differently: `STRATA_HIP_WMMA` works on gfx1100 (the prompt attention on
-matrix cores), while `STRATA_SELECT_WMMA` (the QSA block scorer on matrix cores) in v0.2.8 is gfx12-only, so that half
-of the fork's WMMA advantage is not available here.
-
-Measured on this box, oct3, production config, 4 reps (`perf/raw/perf-fa54-*.jsonl`):
+**Deployed on 2026-10-30** as the production unit's environment (engine 0.1.54 from this repo). Both WMMA halves work
+on gfx1100 after all: `sel_gfx12_device()` in `qsa_select.cu` already accepts gfx11 through
+`gfx_arch_is_gfx11_wmma()` (the kernel has a gfx11 fragment layout, `STRATA_SEL_GFX11`), it was only the
+`STRATA_SELECT_WMMA` opt-in that was missing from the arm. Measured on this box, oct3, production config, 4 reps
+(`perf/raw/perf-fa54-*.jsonl`):
 
 | arm | 32K prefill | 96K prefill |
 |---|---|---|
 | base | 1864 | 1787 |
 | the ten arithmetic switches + the staging ring | 2108 | 2008 |
 | + `HIP_WMMA` | 2090 | 1928 |
-| + GDN / `PF_F16` / `PREFILL_AUTO_MAX` / `STAGER_RING` | **2243** | 1979 |
+| + GDN / `PF_F16` / `PREFILL_AUTO_MAX` / `STAGER_RING` | 2243 | 1979 |
+| + `SELECT_WMMA` | **2280** | **2304** |
 
-So the forum's 2x is, on this engine, +13% from the prompt fusion/GEMM/CPU-share group and another +6% from the GDN
-chunked recurrence and the staging/chunk group; the matrix-core prompt attention adds nothing measurable on this model
-(it does engage - `strata: STRATA_HIP_WMMA: the prompt attention on matrix cores on (gfx1100)`). The rest of their
-2x sits in code that v0.2.8 does not have: `SELECT_WMMA` on gfx11, `PA_KLDS`, `PREFILL_MMQ_TILE_ROWS`,
-`PF_GROUP_RES`, and the `--ple-io direct` + row-cache pairing.
+So the forum's 2x is, on this engine, +13% from the prompt fusion/GEMM/CPU-share group, another +6% from the GDN
+chunked recurrence and the staging/chunk group, and +16% at 96K from the matrix-core block scorer (the scorer's work
+grows with the context, so 32K barely moves). `HIP_WMMA` alone adds nothing measurable on this model (it does engage -
+`strata: STRATA_HIP_WMMA: the prompt attention on matrix cores on (gfx1100)`). What is still absent is code v0.2.8 does
+not have: `PA_KLDS`, `PREFILL_MMQ_TILE_ROWS`, `PF_GROUP_RES`, and the `--ple-io direct` + row-cache pairing.
+
+Selection quality: `SELECT_WMMA`'s ids are identical to the warp scorer's here - 29,995 positions over five
+6,000-token segments, top-1 100.00%, KL 0.00000, full switch set on both sides.
 
 Quality (`perf/knob-quality.txt`): the stdin `run` path is bitwise identical with and without the set; the batched
 prompt path keeps top-1 on all 20 prompts with mean KL 0.0138 (13-switch half) and 0.0170 (full set) against the

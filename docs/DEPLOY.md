@@ -94,6 +94,7 @@ Environment=STRATA_PF_GEMM=1
 Environment=STRATA_PF_PAD=1
 Environment=STRATA_PF_HCDOWN=1
 Environment=STRATA_HIP_WMMA=1
+Environment=STRATA_SELECT_WMMA=1
 Environment=STRATA_GDN_CHUNKED=1
 Environment=STRATA_GDN_HEAD=1
 Environment=STRATA_GDN_CONVL2=1

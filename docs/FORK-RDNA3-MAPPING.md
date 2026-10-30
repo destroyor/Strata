@@ -52,24 +52,48 @@ STRATA_PF_PAD=1 STRATA_PF_HCDOWN=1
 0.1.49.2 without a KL check. Next step: ablate one switch at a time (prefill speed), then `tools/quant_quality.py`
 on the survivors, then deploy.
 
-## 2. What upstream does not have at all
+## 2. What upstream does not have, and its status in v0.2.8
 
-Verified by grep of v0.2.8's `src` and `include`: none of these names occur.
+Verified by grep of v0.2.8's `src` and `include`. "Absent" means the behaviour is not there under any name I could
+find; "in another form" names what is there instead.
 
-| fork switch / feature | kind | where | fork's own claim |
+| fork switch / feature | kind | fork's own claim | status in v0.2.8 |
 |---|---|---|---|
-| `STRATA_SPEC_CUM` | decode | draft cumulative-probability floor (adapted from android-imdad/Strata-7900xtx, `02602e1`) | fewer wasted verify slots |
-| `STRATA_COMBINE_CPU` | decode | the expert combine reads the CPU share's rows straight from the mapped buffer, fused with the GPU rows | one less pass over the CPU share |
-| `STRATA_WAIT_FUSE` | decode | the CPU-share wait moved into every combine block | fewer stalls at the combine |
-| `STRATA_ROUTE_PUBLISH` | decode | top-10 route and the doorbell publish in one launch | one launch fewer per layer |
-| `STRATA_RDNA_MMVQ_WAVE` | decode | gfx1100 wave count for the multi-column GEMV (1 = all shapes, 2 = measured small formats) | small-format GEMVs |
-| `STRATA_RDNA_Q6K` | decode | gfx1100 multi-column Q6_K x q8_1 GEMV (`rdna_mmvq.cu`) | Q6_K layers only |
-| `STRATA_GR_RDNA*`, `GR_FUSED`, `GR_INJ_UP` | decode | hyper-connection int8 GEMV on RDNA; `GR_FUSED` runs down and up in one launch with a grid barrier (`84b27e8`) | bitwise; IQ3 single 20.69 → 20.54 ms/window, dual suite 136.9 → 139.7 (mixed) |
-| `STRATA_PA_KLDS` | prefill | prompt attention stages K through LDS like V (`c3b16b1`) | bitwise; QSA attention 1102 → 993 ms at 32K |
-| `STRATA_PREFILL_MMQ_TILE_ROWS` | prefill | tile rows for the prompt MMQ GEMM (`moe_mmq.cu`) | tuning knob |
-| CPU IQ3_S / IQ3_XXS gate/up byte planes | both | AVX-512 `vpermt2b` rows for the CPU expert share (`d83ecfc`) | bit for bit ggml-cpu's dot |
+| `STRATA_SPEC_CUM` | decode | draft cumulative-probability floor (android-imdad/Strata-7900xtx, `02602e1`) | **in another form, and only for DFlash2**: `--draft-conf` gates the chain product in the `dflash2` drafter; the MTP window (`--mtp`, this box) has only `--spec-min-p`'s per-draft floor. **Ported for MTP in this fork** (`fork-accel`), see §2a |
+| `STRATA_COMBINE_CPU` | decode | the expert combine reads the CPU share's rows from the mapped buffer, fused with the GPU rows | absent. Upstream's closest is `STRATA_LFUSE` (S26: fewer launches around the shared expert and the KV append), which is a different fusion |
+| `STRATA_WAIT_FUSE` | decode | the CPU-share wait in every combine block | absent |
+| `STRATA_ROUTE_PUBLISH` | decode | top-10 route and doorbell publish in one launch | **in another form**: upstream's `doorbell_publish_res` publishes the resident plan's results (route included) in one call; the route itself is still its own `resident_plan` launch in both |
+| `STRATA_RDNA_MMVQ_WAVE` | decode | gfx1100 wave count for the multi-column GEMV | absent. The gfx1100 GEMV table upstream has is the one this fork added in `gfx1100-mmvf-rows1` (rows per block), not a wave switch |
+| `STRATA_RDNA_Q6K` | decode | gfx1100 multi-column Q6_K x q8_1 GEMV (`rdna_mmvq.cu`) | absent: v0.2.8 has no `rdna_mmvq.cu`; Q6_K goes through `iq_kernels.cu`'s generic chain |
+| `STRATA_PREFILL_MMQ_TILE_ROWS` | prefill | tile rows for the prompt MMQ GEMM (`moe_mmq.cu`) | absent as a knob. `moe_fused_iq.cu` computes its tile rows at compile time (`tile_rows(ww, nt)`), a different kernel |
+| `STRATA_GR_RDNA*`, `GR_FUSED`, `GR_INJ_UP` | decode | hyper-connection int8 GEMV on RDNA; down and up in one launch with a grid barrier (`84b27e8`) | absent (`rdna_gr.cu` has no upstream counterpart). Upstream's nearest is `STRATA_GR_V3`, the stream-split read in `fused_gr.cu` |
+| `STRATA_PA_KLDS` | prefill | prompt attention stages K through LDS like V (`c3b16b1`, bitwise) | absent, **but the premise moved**: v0.2.8's prompt kernel fetches a chunk's K fragments and scales into a `Chunk` structure ahead of the WMMA loop, which 0.1.43 did not. A port needs a re-measurement, not a mechanical move |
+| CPU IQ3_S / IQ3_XXS gate/up byte planes | both | AVX-512 `vpermt2b` rows for the CPU expert share (`d83ecfc`, bit for bit) | absent: `src/kernels/cpu/iq_avx512.cpp` handles IQ3_S row-wise, and has no byte-plane path |
 
 `f74ba4f` (wide top-k compiled on HIP) is **not** missing: v0.2.8 has `block_topk_wide_kernel` without a HIP guard.
+
+### 2a. `STRATA_SPEC_CUM`, ported for the MTP path
+
+`src/program/generate.cpp` only: a `spec_cum_floor()` helper (`STRATA_SPEC_CUM=P`, unset or 0 = off) and the product
+of the draft probabilities inside the two MTP window rules (`t_rule` for the serial loop's B chain, and the
+`use_mtp && req_spec_min_p > 0` rule for the window). Where the running product falls below `P` the window ends, so
+fewer low-value drafts are verified. It changes which drafts are verified, never the sample.
+
+Measured on this box, oct3, production config (`--spec 5 --spec-min-p 0.5`), 16-prompt harness, median over 16
+prompts (`perf/raw/tps2-facc-*.txt`):
+
+| arm | tok/s | ms per forward | draft acceptance |
+|---|---|---|---|
+| base (`STRATA_SPEC_CUM` off) | 90.00 / 90.65 | 30.32 / 30.42 | 60.0% / 60.8% |
+| `STRATA_SPEC_CUM=0.25` | 92.15 | 30.64 | 61.8% |
+| **`STRATA_SPEC_CUM=0.4`** | **93.05 / 93.55** | 30.49 / 30.36 | 66.3% / 66.3% |
+| `STRATA_SPEC_CUM=0.6` | 90.00 | 28.01 | 72.8% |
+
+Two runs at 0.4 against two base runs: **+2.4% to +3.6% tok/s**, the same cost per forward, acceptance up ~6 points.
+0.6 cuts the windows too short - the highest acceptance of the four, and no throughput left. 0.4 is what the fork's
+`fork-accel` branch recommends; it stays opt-in (an env var, no CLI change).
+
+
 
 The fork's posted 32K prefill (3511 tok/s) and decode (100.6 tok/s) on a 7900 XTX with a Zen2 / PCIe 3 host (lcz.me
 topic 2671) also depend on the WMMA prompt attention and QSA selection. This repo's CMake probes **rocWMMA** and

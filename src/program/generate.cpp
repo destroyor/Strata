@@ -210,6 +210,18 @@ static void emit_lp_line(const strata::core::Verifier& ver, int t, int32_t token
 
 namespace {
 namespace nib = strata::core::nibble;
+// STRATA_SPEC_CUM=P (opt-in; unset, empty or 0 = off; ported from nicejunjie/Strata-rdna3, itself from
+// android-imdad/Strata-7900xtx): a speculative window also ends where the product of the draft's own probabilities up
+// to that draft (the chance that every draft so far holds) falls below P, beside --spec-min-p's per-draft floor.  It
+// only chooses which drafts are verified - a shorter window is a valid window, and the sample is unchanged.
+double spec_cum_floor() {
+    static const double v = [] {
+        const char* e = std::getenv("STRATA_SPEC_CUM");
+        const double p = e != nullptr ? std::atof(e) : 0.0;
+        return p > 0.0 && p <= 1.0 ? p : 0.0;
+    }();
+    return v;
+}
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
 // a Linux driver has no such limit (#253: the 8 GiB cap cost a 4090 + 3060 split 3x of its prompt speed).
@@ -15991,7 +16003,12 @@ int main(int argc, char** argv) {
                     int T = S_mtp;
                     if (req_spec_min_p > 0.0) {
                         T = 1;
-                        while (T < S_mtp && from + T - 1 < avail && pr[from + T - 1] >= (float) req_spec_min_p) ++T;
+                        double cum = 1.0;   // STRATA_SPEC_CUM: the chance that every draft so far holds
+                        while (T < S_mtp && from + T - 1 < avail && pr[from + T - 1] >= (float) req_spec_min_p) {
+                            cum *= (double) pr[from + T - 1];
+                            if (spec_cum_floor() > 0.0 && cum < spec_cum_floor()) break;
+                            ++T;
+                        }
                     }
                     return std::max(1, std::min(T, 1 + avail - from));
                 };
@@ -16535,7 +16552,12 @@ int main(int argc, char** argv) {
                         T = std::clamp(chain_rows, 1, S_mtp);
                     } else if (use_mtp && req_spec_min_p > 0.0) {
                         T = 1;
-                        while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                        double cum = 1.0;   // STRATA_SPEC_CUM (see t_rule)
+                        while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) {
+                            cum *= (double) dprob[(size_t) T - 1];
+                            if (spec_cum_floor() > 0.0 && cum < spec_cum_floor()) break;
+                            ++T;
+                        }
                     }
                     if (first_window) T = merge_T > 0 ? merge_T : 1;
                     // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it

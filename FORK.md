@@ -6,6 +6,7 @@ two things this box uses that upstream does not have:
 | branch | what | state |
 |---|---|---|
 | `oct3` | `--kv oct3`: K/V as 3-bit Lloyd-Max codes with an exact fp16 window (4 sinks + 1024 newest cells per layer), 448 B/cell | measured on one RX 7900 XTX: quality, prefill, decode, long-context needles; deployed |
+| `fork-accel` | on top of `oct3`: `STRATA_SPEC_CUM` - a cumulative draft-probability floor for the MTP window, ported from nicejunjie/Strata-rdna3 | measured: +3.3% decode tok/s at 0.4 (two runs against two base runs) |
 | `gfx1100-mmvf-rows1` | gfx1100 decode tuning: one row per block for the q8_0 GEMV, `STRATA_MMVF_RPB` for the bf16 multi-row GEMV | measured on engine 0.1.49.2, ported and compiled on v0.2.8, **not re-measured there** |
 
 `main` is untouched upstream. Nothing here changes a default of the path it does not name: without `--kv oct3` the

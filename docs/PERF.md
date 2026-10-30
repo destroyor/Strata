@@ -75,6 +75,22 @@ STRATA_PF_HCDOWN=1`) measured 93.85 tok/s median against 90.4-90.8 for oct3 alon
 rounding (PF_GEMM, PF_FUSED, PA_FAST) and its quality has not been checked with `tools/quant_quality.py`'s KL
 yardstick.
 
+## Speculative window floor (`STRATA_SPEC_CUM`, fork port)
+
+16-prompt harness, production config (`--spec 5 --spec-min-p 0.5`), oct3, two runs per arm at the extremes,
+`perf/raw/tps2-facc-*.txt`:
+
+| arm | tok/s (median of 16 prompts) | ms per forward | acceptance |
+|---|---|---|---|
+| off | 90.00 / 90.65 | 30.32 / 30.42 | 60.0% / 60.8% |
+| 0.25 | 92.15 | 30.64 | 61.8% |
+| 0.4 | 93.05 / 93.55 | 30.49 / 30.36 | 66.3% / 66.3% |
+| 0.6 | 90.00 | 28.01 | 72.8% |
+
++3.3% median throughput at 0.4, the cost per forward unchanged, acceptance +6 points. 0.6 ends the windows early
+enough that the gain is gone. The floor only chooses which drafts are verified; the sample is unchanged, so no KL run
+is needed for it (unlike the prefill switches above).
+
 ## Quality
 
 `perf/kl-tables.txt` (produced by `tools/quant_quality.py compare`), repeated in `docs/OCT3.md`. Reference is the same

@@ -182,6 +182,12 @@ The deployed service with the switch in its unit (the same production config, `p
 **3,504 / 3,507 / 3,505 tok/s**; 96K needles 3 of 3 at depths 10/50/90. Decode is untouched - the prompt attention
 does not run there.
 
+Decode, the same 16-prompt harness on the deployed binary (`perf/raw/tps2-decout-*.txt`), three runs with the switch
+and one without: **ms per forward 29.96 / 30.02 / 30.44 against 30.22** - the step itself is unchanged, as the decode
+kernels are. Throughput reads 92.0 / 90.3 / 94.45 tok/s against 96.25, all of it draft acceptance (66.3 / 66.6 /
+68.1% against 68.9%): `STRATA_PA_FAST=1` moves the prompt attention by 3.5e-4, which the drafter's acceptance sees at
+that scale. `STRATA_PA_FAST=0` (fp32-level, 7e-7) brings it back and costs the prefill path ~5% (3,280 / 3,320).
+
 ## Quality
 
 `perf/kl-tables.txt` (produced by `tools/quant_quality.py compare`), repeated in `docs/OCT3.md`. Reference is the same

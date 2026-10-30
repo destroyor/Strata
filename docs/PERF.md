@@ -93,17 +93,24 @@ is needed for it (unlike the prefill switches above).
 
 ## On the v0.2.8 port (engine 0.1.54)
 
-`perf/raw/perf-fa54-base.jsonl` and `perf-fa54-knobs.jsonl`, oct3, production config, 4 reps, same harness as the
-tables above:
+The same config on both engines (`--kv-resident 32768`, `--prefill auto:8192`), only `--kv` and the binary differ,
+4 reps, `perf/raw/perf-k8v4b.jsonl`, `perf-oct3b.jsonl`, `perf-u54-k8v4.jsonl`, `perf-u54-oct3.jsonl`:
 
-| arm | 32K prefill | 96K prefill | 32K ms/fwd | 96K ms/fwd |
-|---|---|---|---|---|
-| base | 1864 tok/s | 1787 tok/s | 28.22 | 26.68 |
-| the fork's upstream switches (§1 of `docs/FORK-RDNA3-MAPPING.md`) | 2108 tok/s | 2008 tok/s | 25.33 | 26.11 |
+| engine | KV | 32K prefill | 96K prefill | 32K ms/fwd | 96K ms/fwd |
+|---|---|---|---|---|---|
+| 0.1.49.2 | k8v4 | 1458 tok/s | 1373 tok/s | 24.91 | 25.55 |
+| 0.1.49.2 | oct3 | 1458 | 1378 | 25.64 | 26.17 |
+| 0.1.54 (this repo) | k8v4 | 1468 | 1377 | 26.14 | 25.60 |
+| 0.1.54 (this repo) | oct3 | 1456 | 1378 | 25.82 | 25.14 |
 
-The port's prefill is within 1% of the 0.1.49.2 engine (1880 / 1794) and the switch set adds the same +13% / +12% it
-added there. Decode per forward is 2-3 ms slower on 0.1.54 in this harness. Whether that belongs to 0.1.54 itself or
-to the port is **not separated yet**: that needs the same arm on upstream v0.2.8 without oct3.
+**The port costs nothing measurable**: prefill is the same across the two engines and the two formats, and ms per
+forward is within 1 ms in all four cells. The production config (`--kv-resident 65536 --prefill auto:32768`) measured
+28.22 / 26.68 ms per forward on 0.1.54 in `perf-fa54-base.jsonl`, higher than any cell here, but that arm's four reps
+span 25.2-31.4 ms - one run of a noisier configuration, not used to claim a difference either way.
+
+The switch set of `docs/FORK-RDNA3-MAPPING.md` §1 adds +13% / +12% prefill on top of the 0.1.54 row
+(`perf-fa54-knobs.jsonl`: 2108 / 2008 tok/s, 25.33 / 26.11 ms per forward). It is available as an opt-in environment
+file, `perf/presets/gfx1100-prefill.env`, with the quality numbers that come with it.
 
 ## Quality
 

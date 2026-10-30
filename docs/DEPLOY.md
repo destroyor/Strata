@@ -105,6 +105,11 @@ KV streaming 65,536 of 262,144 cells per QSA layer plus 2.39 GiB of pinned K/V, 
 layers. `710 MiB of VRAM free with everything loaded` on the v0.2.8 build; the verify graph's capture then takes
 ~550 MiB of that. **Plan capacity with the post-capture number, not the load-time one.**
 
+Optional and measured, not enabled by default: [`perf/presets/gfx1100-prefill.env`](../perf/presets/gfx1100-prefill.env)
+- upstream's gfx1151/gfx12 switches, +13% prefill at 32K on this box, at a prompt-path KL of 0.0138 against the
+unswitched run (`docs/FORK-RDNA3-MAPPING.md` §1 has the numbers and the one unreproduced hang). Add its lines to the
+unit's `Environment=` only if that trade is wanted.
+
 ## 4. Start, stop, verify
 
 ```bash

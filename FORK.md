@@ -1,7 +1,7 @@
 # What this fork is
 
 A fork of [Niko1221/Strata](https://github.com/Niko1221/Strata), branched from **v0.2.8** (engine 0.1.54), carrying
-two things this box uses that upstream does not have:
+what this box uses and upstream does not have (or leaves off on gfx1100):
 
 | branch | what | state |
 |---|---|---|
@@ -11,6 +11,9 @@ two things this box uses that upstream does not have:
 
 `main` is untouched upstream. Nothing here changes a default of the path it does not name: without `--kv oct3` the
 engine runs exactly what upstream runs, and `oct3` is opt-in.
+
+Also measured, opt-in and not a branch: `perf/presets/gfx1100-prefill.env`, upstream's gfx1151/gfx12 switches on
+gfx1100, +13% prefill at 32K with a prompt-path KL of 0.0138 (`docs/FORK-RDNA3-MAPPING.md` §1).
 
 ## Where the numbers and the instructions are
 

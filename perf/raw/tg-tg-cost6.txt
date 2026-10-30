@@ -1,0 +1,3 @@
+{"label": "tg-cost6-warm", "target": 32768, "chars": 168755, "prompt_tokens": 33072, "usage_prompt_tokens": 33072, "pp": 3122.7, "tg": 84.0, "ms_fwd": 32.41808510638298, "acc": 63.529411764705884, "gen": 256, "drafts": 255, "accepted": 162, "wall_s": 13.7}
+{"label": "tg-cost6", "target": 32768, "chars": 168755, "prompt_tokens": 33072, "usage_prompt_tokens": 33072, "pp": 3097.7, "tg": 95.6, "ms_fwd": 30.435227272727275, "acc": 68.29268292682927, "gen": 256, "drafts": 246, "accepted": 168, "wall_s": 13.4}
+{"label": "tg-cost6", "target": 65536, "chars": 337510, "prompt_tokens": 66242, "usage_prompt_tokens": 66242, "pp": 3301.5, "tg": 86.8, "ms_fwd": 30.40824742268041, "acc": 59.550561797752806, "gen": 256, "drafts": 267, "accepted": 159, "wall_s": 23.0}

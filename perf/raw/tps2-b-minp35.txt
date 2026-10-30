@@ -1,0 +1,13 @@
+prefill+first: 11.2 s (160810 chars)
+  Summarise section 3 of this    rep0   84.9 tok/s   28.62 ms/fwd  acc  59.3%  prompt_n 7
+  Summarise section 3 of this    rep1   90.4 tok/s   26.87 ms/fwd  acc  59.3%  prompt_n 7
+  Summarise section 3 of this    rep2   90.2 tok/s   26.40 ms/fwd  acc  58.5%  prompt_n 7
+  List the three claims about    rep0  107.9 tok/s   29.23 ms/fwd  acc  81.2%  prompt_n 31054
+  List the three claims about    rep1  112.6 tok/s   28.24 ms/fwd  acc  80.7%  prompt_n 7
+  List the three claims about    rep2  117.9 tok/s   26.75 ms/fwd  acc  80.0%  prompt_n 7
+  What does the text say about   rep0  109.4 tok/s   35.99 ms/fwd  acc  78.3%  prompt_n 31054
+  What does the text say about   rep1  110.3 tok/s   35.71 ms/fwd  acc  78.3%  prompt_n 7
+  What does the text say about   rep2  112.6 tok/s   34.98 ms/fwd  acc  78.3%  prompt_n 7
+  Explain the verification win   rep0   82.2 tok/s   27.37 ms/fwd  acc  57.6%  prompt_n 31054
+  Explain the verification win   rep1   84.3 tok/s   26.49 ms/fwd  acc  53.8%  prompt_n 7
+  Explain the verification win   rep2   90.9 tok/s   26.75 ms/fwd  acc  60.8%  prompt_n 7

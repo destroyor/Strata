@@ -74,3 +74,13 @@ sh0q6	160000	95.65	27.42	71.8	strata-sc117-iq3_s.json	prod + SH_STREAM=0 GPU_MAX
 pw4	160000	91.85	27.92	72.2	ab/cfg-w4.json	prod, pool-workers 4
 pw8	160000	94.80	27.71	72.5	ab/cfg-w8.json	prod, pool-workers 8
 cost6	160000	94.55	29.59	66.6	ab/cfg-spec6b.json	prod + SPEC_COST=1
+minp0	160000	92.25	28.93	56.5	ab/cfg-minp0.json	prod + RDNA_Q6K, spec-min-p 0
+minp20	160000	98.60	27.04	71.7	ab/cfg-minp20.json	prod + RDNA_Q6K, spec-min-p 0.2
+minp25	160000	99.30	27.18	70.3	ab/cfg-minp25.json	prod + RDNA_Q6K, spec-min-p 0.25
+minp25b	160000	101.05	26.69	71.6	ab/cfg-minp25.json	prod + RDNA_Q6K, spec-min-p 0.25
+minp25c	160000	98.60	27.34	71.6	ab/cfg-minp25.json	prod + RDNA_Q6K, spec-min-p 0.25
+minp25c5	160000	96.75	26.51	74.1	ab/cfg-minp25.json	prod + RDNA_Q6K, spec-min-p 0.25 CUM=0.5
+minp30	160000	98.90	26.76	68.0	ab/cfg-minp30.json	prod + RDNA_Q6K, spec-min-p 0.3
+nosfx	160000	94.75	26.76	72.4	ab/cfg-nosfx.json	prod + RDNA_Q6K, suffix-draft 0
+rtl-fuse	160000	102.50	26.53	74.7	strata-sc117-iq3_s.json	prod + RDNA_Q6K + COMBINE_CPU FUSE_WAIT ROUTE_PUBLISH
+rtl-ctl	160000	96.85	26.42	70.8	strata-sc117-iq3_s.json	prod + RDNA_Q6K

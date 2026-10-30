@@ -210,6 +210,62 @@ i.e. 70% / 63% per-draft acceptance against 78% / 82%). Swapping the document fo
 text moves our acceptance only between 60% and 67%, so it is not our text being harder - their drafter's proposals
 land better on their engine (0.1.43) than ours do on 0.1.54, with the same draft head file.
 
+### 2e. The window cut (`--spec-min-p`), scanned
+
+The floor decides how many of the drafter's proposals the window verifies. It only chooses which rows are verified,
+never the sample, so it is the one remaining throughput knob that costs no quality. Scan on the deployed binary
+(16-prompt harness, production config and env):
+
+| `--spec-min-p` | tok/s | ms per forward | acceptance |
+|---|---|---|---|
+| 0.5 (deployed) | 96.85 / 99.70 / 98.85 | 26.42 / 26.45 / 26.83 | 69.5 / 72.2 / 70.8 |
+| 0.30 | 98.90 | 26.76 | 68.0 |
+| 0.25 | 99.30 / 101.05 / 98.60 | 27.18 / 26.69 / 27.34 | 70.3 / 71.6 / 71.6 |
+| 0.20 | 98.60 | 27.04 | 71.7 |
+| 0 (full 5-row windows) | 92.25 | 28.93 | 56.5 |
+| 0 with `--spec 6` | 87.90 | 32.82 | 46.7 |
+| 0.25 with `STRATA_SPEC_CUM=0.5` | 96.75 | 26.51 | 74.1 |
+
+0.25 verifies ~2.7 rows per forward instead of 2.2: **+1.2% tok/s over three runs each (within noise)** for +1.9%
+per forward. 0 is far too wide (4 rows, acceptance collapses to 56%). The automated form of this trade is
+`STRATA_SPEC_COST=1` (§2d), which lands in the same place. Not deployed: no clear win, and it makes every forward
+more expensive.
+
+`STRATA_MTP_DRAFT_ALL` (the fork's one-graph drafting, the cut applied afterwards by the caller) was **not** ported:
+at `--spec-min-p 0` our drafter already takes its one-graph path, and that arm is 3% *slower* than 0.5 - the extra
+draft steps cost more than the host round trips they would save.
+
+### 2f. The reference engine built here: 121 tok/s, and it is not the switches
+
+The fork's tree was built on this box (0.1.43, `fc8f823`, ROCm 10.2, gfx1100) and run against *this* model and *this*
+harness's documents (`ab/tg_fork.sh`, `ab/tg_sweep.py --port 8090`), 256 tokens, one fresh document per size:
+
+| arm (their engine, our box and text) | 32K TG | ms/fwd | 64K TG | ms/fwd |
+|---|---|---|---|---|
+| their preset (42 switches, `--kv int8`) | **121.6** | 21.26 | **119.0** | 20.89 |
+| minus the `GR_*` group | 125.0 | 20.69 | 117.3 | 21.19 |
+| minus `RDNA_MMVQ_WAVE` / `RDNA_Q6K` | 119.3 | 21.03 | 117.1 | 21.03 |
+| minus the `PF_*` / `PA_KLDS` / tile-rows group | 125.0 | 20.90 | 114.7 | 21.46 |
+| `--kv oct3 --kv-resident 65536` (our format) | 124.8 | 21.37 | 117.0 | 21.03 |
+| ours (0.1.54 + `RDNA_Q6K`), same protocol | ~93 | ~27 | ~84 | ~27 |
+
+So their 106 on a 6-core Zen2 is 119-125 on this 16-core host, and **none of their switch groups explains it**: every
+subset above lands within noise of the full preset, and the KV format does not matter either. The difference is
+0.1.43 against 0.1.54 for this model - 21.0 ms against 27.5 ms per forward at the same window width and the same
+draft acceptance.
+
+Two candidate explanations that are **ruled out by measurement**:
+
+- *Launch count.* Their 6-token window graph has 1192 nodes, ours 1829. Our three B-class fusions (§2b) remove 240
+  of them and 0.0 ms; their own `GR_*` group fuses 6 launches per layer into 2 and 0.0 ms. Graph nodes overlap with
+  execution here; the window is not launch-bound.
+- *The CPU expert share.* 4 pool workers instead of 15 cost 4% (§2d), so the host is not on the critical path.
+
+What is left is the decode work itself between `v0.1.43` and `v0.1.54` (this repo carries both tags): the window
+captures roughly twice as many `native_down_multi` / `swiglu_q8_1_entries` / `native_mmvq_multi` nodes per layer as
+the fork's, and some of that is real work, not just launches. Bisecting that range with this harness (32K, one
+document, engine timings) is the next step to reach the fork's number on our engine.
+
 
 
 The fork's posted 32K prefill (3511 tok/s) and decode (100.6 tok/s) on a 7900 XTX with a Zen2 / PCIe 3 host (lcz.me

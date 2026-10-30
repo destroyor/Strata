@@ -122,6 +122,16 @@ shared expert's gate/up), which is what it targets. 16-prompt harness, productio
 +3.5% tok/s, -4.1% ms per forward, identical answers on the three QA questions, 32K needle 3/3. Deployed on the unit
 2026-10-31. What else was tried against the same harness and did not move it is in `docs/FORK-RDNA3-MAPPING.md` §2d.
 
+### Where the fork's 106 tok/s really comes from
+
+Their tree built and run on this box, this model and the same documents: **121.6 / 119.0 tok/s at 32K / 64K**
+(21.0-21.3 ms per forward), against our ~93 / ~84 (~27.5 ms). No switch group of theirs accounts for it (GR group
+off, RDNA group off, PF/PA group off: all inside noise) and neither does the KV format (`--kv oct3` on their engine
+is the same). It is 0.1.43 against 0.1.54: 1192 window-graph nodes against 1829, and roughly twice the
+`native_down_multi` / `swiglu_q8_1_entries` / `native_mmvq_multi` work per layer. Launch count is ruled out - our
+B-class fusions remove 240 nodes and 0.0 ms - and so is the CPU share (4 pool workers cost 4%). The number to beat on
+this hardware is 121, not 106. Details in `docs/FORK-RDNA3-MAPPING.md` §2f.
+
 ## On the v0.2.8 port (engine 0.1.54)
 
 The same config on both engines (`--kv-resident 32768`, `--prefill auto:8192`), only `--kv` and the binary differ,

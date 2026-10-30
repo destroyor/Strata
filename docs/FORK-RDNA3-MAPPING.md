@@ -48,9 +48,24 @@ STRATA_VERIFY_QDEDUP=1 STRATA_KV_HOST_DMA=1 STRATA_PF_FUSED=1 STRATA_PF_GEMM=1 \
 STRATA_PF_PAD=1 STRATA_PF_HCDOWN=1
 ```
 
-**Not deployed.** `PF_GEMM`, `PF_FUSED` and `PA_FAST` change prefill rounding, and this arm was measured on
-0.1.49.2 without a KL check. Next step: ablate one switch at a time (prefill speed), then `tools/quant_quality.py`
-on the survivors, then deploy.
+**Not deployed yet.** The gain is real but it is not free, and one run of the set produced no answer:
+
+- **Prefill** on this fork's base (engine 0.1.54, oct3, production config, 4 reps, `perf/raw/perf-fa54-*.jsonl`):
+  1864 → 2108 tok/s at 32K (+13.1%) and 1787 → 2008 at 96K (+12.4%). Decode shows no consistent change (ms per
+  forward 28.22 → 25.33 at 32K, 26.68 → 26.11 at 96K; the 16-prompt harness measured 90.0 → 82.1 tok/s in one run
+  each, which the per-forward numbers do not support - that harness is the noisier of the two).
+- **Quality** (`perf/knob-quality.txt`): the stdin `run` path (one token per call, CPU experts, 4,995 positions) is
+  bitwise identical with and without the set. The batched prompt path (20 prompts of 256-1,000 tokens, 1,500 GPU
+  experts) keeps top-1 on all 20 prompt ends, with mean KL 0.0138 to the unswitched run (median 0.00026, max 0.134);
+  the two halves alone are 0.0105 and 0.0121. For scale: oct3 with its window is 0.0185 and k8v4 0.0396 on the KV
+  yardstick. So the set buys 12.5% prefill for a prompt-path distribution shift of the order of a KV format change,
+  which is a policy decision, not a free win.
+- **One hang**: the first all-ten run answered nothing on its first 256-token prompt (no error line; the harness
+  killed it). Two halves and a retry of the full set completed; treat it as a cold-start flake until it recurs.
+
+If the trade is taken, the arm to ship is the ten switches above plus `STRATA_PREFILL_RING=192`,
+`STRATA_PREFILL_CPU_SHARE=auto`, `STRATA_PREFILL_CPU_SHARE_MAX=6144`, and it should be re-run through all three
+harnesses plus a needle pass on this engine before the production unit names it.
 
 ## 2. What upstream does not have, and its status in v0.2.8
 

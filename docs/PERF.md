@@ -91,6 +91,20 @@ yardstick.
 enough that the gain is gone. The floor only chooses which drafts are verified; the sample is unchanged, so no KL run
 is needed for it (unlike the prefill switches above).
 
+## On the v0.2.8 port (engine 0.1.54)
+
+`perf/raw/perf-fa54-base.jsonl` and `perf-fa54-knobs.jsonl`, oct3, production config, 4 reps, same harness as the
+tables above:
+
+| arm | 32K prefill | 96K prefill | 32K ms/fwd | 96K ms/fwd |
+|---|---|---|---|---|
+| base | 1864 tok/s | 1787 tok/s | 28.22 | 26.68 |
+| the fork's upstream switches (§1 of `docs/FORK-RDNA3-MAPPING.md`) | 2108 tok/s | 2008 tok/s | 25.33 | 26.11 |
+
+The port's prefill is within 1% of the 0.1.49.2 engine (1880 / 1794) and the switch set adds the same +13% / +12% it
+added there. Decode per forward is 2-3 ms slower on 0.1.54 in this harness. Whether that belongs to 0.1.54 itself or
+to the port is **not separated yet**: that needs the same arm on upstream v0.2.8 without oct3.
+
 ## Quality
 
 `perf/kl-tables.txt` (produced by `tools/quant_quality.py compare`), repeated in `docs/OCT3.md`. Reference is the same

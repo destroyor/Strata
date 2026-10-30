@@ -94,6 +94,43 @@ run); the throughput is 1-3% lower because a 3-bit K loses a point or two of dra
 The production config (oct3, `--kv-resident 65536`, `--prefill auto:32768`) measures 1880 tok/s prefill at 32K,
 1794 at 96K, 25.0 / 25.5 ms per forward.
 
+## Why oct3 cannot use the matrix-core prompt attention (the prefill gap)
+
+Measured: oct3 prefills at 2280 / 2304 tok/s (32K / 96K); `--kv int8` with the same 23 switches prefills at
+3506 / 3559 (`docs/PERF.md`). The difference is not tuning. On AMD the batched prompt attention exists only for INT8
+pools, and oct3 fails every one of its conditions:
+
+1. **The runtime gate** (`src/kernels/cuda/qsa_prompt_attn.cu:2374-2383`): on HIP the function returns the
+   matrix-core launch only when `k_q`, `v_q`, `k_scale`, `v_scale` are set **and** `k_q4`/`v_q4` are null (plus
+   `hip_wmma_usable`). oct3 keeps its codes in the q4 pointers (`src/core/layer.cpp`: `st.k_q4 = c.take<uint8_t>(rows * oct_row)`),
+   so the condition is false before any format check of ours runs.
+2. **Our own guard** (`qsa_prompt_attn.cu:2387`): `if (pools.oct3) return false;` - an explicit refusal, not an
+   accident of the above.
+3. **The other batched path** (`qsa_pattn.cu:413`): `k_q4 != nullptr` also disqualifies oct3 from `qsa_pattn_batch`.
+4. **The fallback** is the decode kernel: `qsa_decode_attn_batch` on windows of 32 queries (`prefill.cpp`,
+   `attn_batch = 32`), which runs `attn_chunk_kernel<4>` - 64-cell chunks, FP32 FMA per element, and a 3-bit unpack
+   per value (3 bit-plane bytes + shifts + a level lookup). No tensor cores, no fp16 staging, and each query re-reads
+   its own selected cells.
+
+Even if the gate were opened, the int8 kernel cannot read oct3's layout without two changes:
+
+- **Scale granularity.** The kernel applies one fp16 scale per 64 dims (`k_scale[row][HD/64]`, `v_scale` likewise) to
+  the sum of four 16-dim fragments, *after* the MMA. oct3 carries one fp16 `d` per **32** values (`QK_OCT = 32`,
+  `kv_octave.hpp`) plus a fixed 1/32, so a warp's 64 dims span two different scales. The scale has to be folded into
+  the fp16 conversion per element, before the MMA - which means the K fragments must be fp16 (2x the registers of the
+  current int8 words: 2 tiles x 4 kk x 16 halfs = 64 registers against 32) and the V staging must hold fp16 for 64
+  dims per cell (128 B/cell; the current shared array is 80 B, so ~16 KB more LDS).
+- **Code layout.** An int8 fragment is 16 contiguous bytes, one `uint4` load; an oct3 fragment is 16 values unpacked
+  from 3 bit-planes (6 bytes) with a block boundary never falling inside the 16 (QK_OCT = 32, fragments are 16-aligned).
+
+Doing both is a contained kernel job (a loader variant plus the dispatch parity test), and the estimate is that oct3
+would then land 5-10% behind int8 (the unpack cost remains) - about 3.2-3.4K rather than 3.5K. It is not a switch, and
+it was not done here.
+
+`HIP_WMMA` has no effect on oct3 for the same reason: the log line says the matrix-core prompt attention is on, but the
+format gate rejects the call, and the measured prefill is unchanged (2090 / 1928 with it, 2243 / 1979 without, per
+`perf/raw/perf-fa54-wmma.jsonl`).
+
 ## What it does not do
 
 - **Gather path only.** There is no fused decode-attention mode for oct3 (`qsa_decode_attn.cu` falls back to the

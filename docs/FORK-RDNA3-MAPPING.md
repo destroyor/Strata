@@ -320,10 +320,48 @@ Do not port a switch without its measurement: the fork itself records `PREFILL_R
 `RDNA_IQ3S` kernel as "correct but slower than the native kernel at T >= 2", which is what a port looks like when the
 number was taken before the code was kept.
 
-Status: `SPEC_CUM` (§2a), the three decode fusions (§2b) and the K-quant GEMV (§2c) are ported and measured; the
-fusions did not clear the gate and stay off, `SPEC_CUM=0.4` and `STRATA_RDNA_Q6K=1` are deployed. §2d lists what did
-not move the number. Still to do: the wave-32 MMVQ layout (`STRATA_RDNA_MMVQ_WAVE`), the `GR_*` int8 hyper-connection
-group, the CPU IQ3_S byte-plane kernel (mostly idle cores here: 4 pool workers cost only 4%), and
+### 2h. The `GR_RDNA` read, and three config-level findings (2026-10-31)
+
+**`STRATA_GR_RDNA=1`, ported as `src/kernels/cuda/rdna_gr.cu`** (the fork's BF16 half only; its int8/A8/grid-barrier
+halves stayed behind). One split-K down launch (8 half-stream slices x 21 row groups of 16 rows) replaces the norm and
+down launches, one up launch (160 blocks, four lanes per `w_up` row, the eight partials folded in the prologue)
+replaces up+gate+mean. Same maths, another summation order. 32K, prod switches, lcz.me protocol:
+
+| | tok/s | ms/window | acceptance |
+|---|---|---|---|
+| control | 98.1 | 27.47 | 73.2% |
+| `GR_RDNA=1` | 102.1 | 26.39 | 73.5% |
+| + PLE direct (below) | 103.9 | 25.94 | 73.5% |
+| + `--mtp-window 4096` | 104.8 | 24.68 | 73.7% |
+
+The stage table's six hyper-connection slots fall from 4.73 to ~3.0 ms/window (verified on the 130 with
+`STRATA_VERIFY_PROFILE=1`, which costs ~6% by itself). 16-prompt harness (`win_tps2.sh`, 160K chars, 192 tokens):
+**median 107.25 tok/s**, median 25.7 ms/window, acceptance 73.8% - against 95.6 / 29.5 / 67.3 for the deployed run
+before this session, and 105.65 / 25.20 / 71.9 with PLE direct added (the acceptance column moves by +-2 points
+between runs, which is most of the spread between those two medians).
+
+**`--ple-io mmap` in the production config cost 0.4 ms/window.** The engine's default is `direct` with a 1M-row
+cache; the config had pinned `mmap` (and `--ple-io` being explicit also turns off the auto-probe's fallback decision).
+Its probe reads 70k rows/s; switching back to `direct` (+ `--ple-row-cache 1048576`) is -0.4 ms and no arithmetic
+change.
+
+**The unit's `Environment=STRATA_RDNA_Q6K=1` sat after `[Install]`**, where systemd ignores it: production had been
+running without §2c's +3.5% since it was "deployed". It is now in `[Service]`, together with `STRATA_GR_RDNA=1`.
+
+**Negative results, measured today** (all 32K, same protocol):
+
+| arm | ms/window | acceptance | verdict |
+|---|---|---|---|
+| `--mtp-window 4096` / `8192` | 24.68 / 24.85 (vs 25.94) | 73.7% / 69.5% (vs 73.5%) | 1.1 ms cheaper but 0-4 acceptance points: 8192 is a net loss, 4096 a wash at 32K and worse at longer contexts. Not deployed |
+| `--mtp-q4 all` | 26.46 (vs 26.39) | 74.0% | no gain: the draft is not weight-read bound |
+| `STRATA_HC_Q8=1` (int8 hc weights, the existing S23 path) | 25.21 (vs 27.47) | 65.6% (vs 73.2%) | 2.3 ms cheaper (the read is bandwidth-bound: bf16 317 MB/window at 570 GB/s) but 7.6 acceptance points lost - net loss. An int8 `GR_RDNA` read would need a precision fix first |
+| `STRATA_VERIFY_PROFILE=1` | +0.5-2 ms | | the profiler's own cost (the fork's costs 2.4x: 121.6 -> 44.5 tok/s) |
+
+Status: `SPEC_CUM` (§2a), the three decode fusions (§2b), the K-quant GEMV (§2c) and the `GR_*` read (§2h) are ported
+and measured; the fusions did not clear the gate and stay off, `SPEC_CUM=0.4`, `STRATA_RDNA_Q6K=1` and
+`STRATA_GR_RDNA=1` are deployed (§2h also fixed the unit line that had kept `RDNA_Q6K` off). §2d lists what did not
+move the number. Still to do: the int8 `GR_RDNA` read (blocked on the quality loss in §2h), the wave-32 MMVQ layout
+(`STRATA_RDNA_MMVQ_WAVE`), the CPU IQ3_S byte-plane kernel (mostly idle cores here: 4 pool workers cost only 4%), and
 `PA_KLDS` / `PREFILL_MMQ_TILE_ROWS` (prefill).
 
 ## 4. What we did not take, and why

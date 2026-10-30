@@ -87,3 +87,8 @@ rtl-ctl	160000	96.85	26.42	70.8	strata-sc117-iq3_s.json	prod + RDNA_Q6K
 ref-fuse-off	32768	92.60	28.50	69.1	fork 0.1.43	no COMBINE_CPU/WAIT_FUSE/ROUTE_PUBLISH
 ref-noenv	32768	94.50	27.64	71.2	fork 0.1.43	no env
 u143-upstream	32768	92.50	27.95	68.9	upstream v0.1.43	7 switches
+grctl2-20261031	160000	91.65	28.65	70.9	strata-sc117-iq3_s.json	prod + RDNA_Q6K, VERIFY_PROFILE=1 (its cost ~5%), GR_RDNA off
+grrdna-20261031	160000	107.25	25.68	73.8	strata-sc117-iq3_s.json	prod + RDNA_Q6K + GR_RDNA
+p2med-20261031	160000	105.65	25.20	71.9	strata-sc117-iq3_s.json	prod + RDNA_Q6K + GR_RDNA + PLE direct (deployed)
+c3med-20261031	160000	100.25	24.43	66.0	strata-sc117-iq3_s.json	+ mtp-window 4096: 1 ms cheaper, 6 acceptance points gone
+c60-20261031	160000	100.85	24.25	75.6	strata-sc117-iq3_s.json	+ SPEC_CUM 0.6: fewer tokens per window, net loss

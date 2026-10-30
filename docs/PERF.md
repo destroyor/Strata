@@ -177,6 +177,11 @@ than int8) and its ~5% decode advantage. Kernel level (synthetic, 2,048 queries 
 8.59 ms per chunk against int8's 8.05, 4.2x the FP32 chunk path it replaces; its output is the FP32 kernel's to
 2.0e-9 (7.9e-7 of scale) and the FP64 reference's to 1.1e-9.
 
+The deployed service with the switch in its unit (the same production config, `perf/raw/perf-deployed-paoct.jsonl`):
+32,028 / 31,796 / 32,010-token prompts at **3,457 / 3,455 / 3,444 tok/s**, 95,937 / 96,155 / 95,967-token prompts at
+**3,504 / 3,507 / 3,505 tok/s**; 96K needles 3 of 3 at depths 10/50/90. Decode is untouched - the prompt attention
+does not run there.
+
 ## Quality
 
 `perf/kl-tables.txt` (produced by `tools/quant_quality.py compare`), repeated in `docs/OCT3.md`. Reference is the same

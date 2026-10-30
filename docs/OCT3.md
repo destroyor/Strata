@@ -129,6 +129,10 @@ against `load8_oct`'s formula over 4096 random blocks (V path and K path).
 | `--kv int8` | 3516 | 3557 |
 | **oct3 + `STRATA_PA_OCT=1`** | **3443** | **3513** |
 
+The deployed service (the unit, the production config, `perf/raw/perf-deployed-paoct.jsonl`, 4 reps): **3457 / 3455 /
+3444** at 32K and **3537 / 3504 / 3507 / 3505** at 96K - the forum's 3.5K, 51% over the oct3 gather path it replaces.
+96K needles on the same service: 3 of 3 at depths 10/50/90.
+
 The 3-bit format now prefills within 1-2% of int8, at 2.4x fewer bytes per cell. Kernel level (synthetic, 2,048
 queries over a 32K context): 8.59 ms per chunk against int8's 8.05 (+6.7%), 4.2x the FP32 path it replaces.
 `HIP_WMMA` alone never helped oct3 because the format gate rejected the call before this arm existed (`2090 / 1928`

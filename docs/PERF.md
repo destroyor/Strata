@@ -108,6 +108,20 @@ arms between -1.5% and +1.1% of the control. The fusions are real (ms per forwar
 `COMBINE_CPU`) but too small for this host to show as throughput, so they are not deployed. Greedy answers are
 character-identical on and off.
 
+## The K-quant decode GEMV (`STRATA_RDNA_Q6K`, fork port, deployed)
+
+The fork's `rdna_mmvq.cu`: one wave32 per output row, 8 weights per lane per superblock, decoded once and applied to
+every column of the verify window. This model's dense side is 89 Q6_K tensors (attn q/k/v/gate, qkv, `output`, the
+shared expert's gate/up), which is what it targets. 16-prompt harness, production config, two runs per arm:
+
+| arm | tok/s | ms/fwd | acceptance |
+|---|---|---|---|
+| off | 95.70 / 94.25 | 27.28 / 27.76 | 70.7% / 71.2% |
+| `STRATA_RDNA_Q6K=1` | **97.40 / 99.15** | **26.54 / 26.22** | 71.8% / 71.4% |
+
++3.5% tok/s, -4.1% ms per forward, identical answers on the three QA questions, 32K needle 3/3. Deployed on the unit
+2026-10-31. What else was tried against the same harness and did not move it is in `docs/FORK-RDNA3-MAPPING.md` §2d.
+
 ## On the v0.2.8 port (engine 0.1.54)
 
 The same config on both engines (`--kv-resident 32768`, `--prefill auto:8192`), only `--kv` and the binary differ,

@@ -92,7 +92,7 @@ find; "in another form" names what is there instead.
 | `STRATA_WAIT_FUSE` | decode | the CPU-share wait in every combine block | **in another form**: upstream's 143-amdk `STRATA_FUSE_WAIT` folds the wait into the copy that follows it (`wait_copy_i32_from_mapped`, `copy_rows_from_mapped_after`). **Plan-only on HIP now too** (`STRATA_FUSE_WAIT=2`), which is what the fork's switch does; see §2b |
 | `STRATA_ROUTE_PUBLISH` | decode | top-10 route and doorbell publish in one launch | **in another form**: upstream's `doorbell_publish_res` publishes the resident plan's results (route included) in one call; the route itself is still its own `resident_plan` launch in both. **Ported in this fork** (`STRATA_ROUTE_PUBLISH`), see §2b |
 | `STRATA_RDNA_MMVQ_WAVE` | decode | gfx1100 wave count for the multi-column GEMV | absent. The gfx1100 GEMV table upstream has is the one this fork added in `gfx1100-mmvf-rows1` (rows per block), not a wave switch |
-| `STRATA_RDNA_Q6K` | decode | gfx1100 multi-column Q6_K x q8_1 GEMV (`rdna_mmvq.cu`) | absent: v0.2.8 has no `rdna_mmvq.cu`; Q6_K goes through `iq_kernels.cu`'s generic chain |
+| `STRATA_RDNA_Q6K` | decode | gfx1100 multi-column Q6_K x q8_1 GEMV (`rdna_mmvq.cu`) | absent as this kernel: v0.2.8's `native_mmvq.cu` has Q6_K multi-column through ggml's chain (2 weights per lane per step) and a wave-64 layout. **Ported in this fork and deployed**, see §2c |
 | `STRATA_PREFILL_MMQ_TILE_ROWS` | prefill | tile rows for the prompt MMQ GEMM (`moe_mmq.cu`) | absent as a knob. `moe_fused_iq.cu` computes its tile rows at compile time (`tile_rows(ww, nt)`), a different kernel |
 | `STRATA_GR_RDNA*`, `GR_FUSED`, `GR_INJ_UP` | decode | hyper-connection int8 GEMV on RDNA; down and up in one launch with a grid barrier (`84b27e8`) | absent (`rdna_gr.cu` has no upstream counterpart). Upstream's nearest is `STRATA_GR_V3`, the stream-split read in `fused_gr.cu` |
 | `STRATA_PA_KLDS` | prefill | prompt attention stages K through LDS like V (`c3b16b1`, bitwise) | absent, **but the premise moved**: v0.2.8's prompt kernel fetches a chunk's K fragments and scales into a `Chunk` structure ahead of the WMMA loop, which 0.1.43 did not. A port needs a re-measurement, not a mechanical move |
@@ -162,6 +162,54 @@ opt-in and **off**; the production unit's environment is unchanged.
 Quality: greedy answers on the harness's three questions are character-identical with all three switches on and off,
 and the 16-prompt harness's acceptance is unchanged (72.9% against 73.0%), which is what a bitwise port should show.
 
+### 2c. `STRATA_RDNA_Q6K` / the K-quant multi-column GEMV, ported and deployed
+
+`src/kernels/cuda/rdna_mmvq.cu` (the fork's file, unchanged): one wave32 per output row; for Q6_K every lane takes
+8 consecutive weights of a superblock (ql nibble | qh 2 bits, -32), decodes them once and applies them to every
+column of the window with two `sudot4` - against ggml's chain, which walks 2 weights per lane per step. The same
+file carries Q4_K / Q5_K / IQ4_XS (and IQ3_S) at 8 weights per lane; Q4_K/Q5_K take it from 4 columns, the others
+always. `native_mmvq()` asks it first for types 12/13/14/23 when `STRATA_RDNA_Q6K=1`; the fallback is the wave-64
+kernel this repo already had. It is **not bitwise** the reference kernel (own summation order, same products).
+
+This model's dense side is exactly what it targets (`grep` of the GGUF: 89 Q6_K tensors - attn q/k/v/gate, qkv,
+`output`, the shared expert's gate/up), so decode is where it shows. 16-prompt harness, production env and its 23
+switches, binary `f88e46f6`, two runs per arm (`perf/raw/tps2-b-q6k*.txt`):
+
+| arm | tok/s | ms per forward | acceptance |
+|---|---|---|---|
+| off | 95.70 / 94.25 | 27.28 / 27.76 | 70.7% / 71.2% |
+| **`STRATA_RDNA_Q6K=1`** | **97.40 / 99.15** | **26.54 / 26.22** | 71.8% / 71.4% |
+
+**+3.5% tok/s and -4.1% ms per forward**, both runs of the arm above both runs of the control. Answers on the
+harness's three QA questions are character-identical, and the 32K needle is 3 of 3 with it on. **Deployed** on the
+box on 2026-10-31 (unit environment, 30 switches).
+
+### 2d. What did not move the number, with the numbers
+
+Measured the same way (16-prompt harness, production config) while looking for the fork's 106 tok/s median:
+
+| arm | tok/s | verdict |
+|---|---|---|
+| control (same binary) | 95.7 / 94.25 | - |
+| `STRATA_GDN_PP=1` (the fork's value; we run 2) | 95.4 | neutral |
+| `STRATA_SH_STREAM=0 GPU_MAX_HW_QUEUES=6` (both the fork's) | 95.65 | neutral |
+| `--pool-workers 8` / `4` (we run 15) | 94.8 / 91.85 | the CPU share is hidden: 4 workers cost 4% |
+| `STRATA_SPEC_COST=1` + `--spec 6` | 94.55 | +6-7% on the fork's own protocol, neutral here |
+| `--spec 8` + `STRATA_SPEC_COST=1` | 46-51 (their protocol) | the cost model picks wide windows the card cannot pay for |
+| `--kv-resident 262144` (all cells resident) | 89.4 / 85.7 (theirs protocol) | worse than 65536 |
+
+And the fork's whole argument list on our engine (`--kv int8 --kv-resident 32768 --ple-io direct --ple-row-cache
+1048576 --mtp-window 4096 --mtp-q4 all --expert-cache auto`, their env): 94.7 / 87.5 tok/s on their protocol at
+32K / 64K against our 89.9 / 80.8 - real (+5% / +8%), but its `--expert-cache auto` computes only 6773 slots here
+(17.76 GiB free, 512 MiB reserved) where our fixed 7700 gives 8854, and it leaves 502 MiB of VRAM free with the
+engine's own warning attached.
+
+Where the rest of their lead is: on their protocol our cost per forward is already at parity (28.3 ms against their
+28.2 at 32K), and the gap is **drafts accepted per forward** (1.56 / 1.29 against their 1.84 / 1.91 at 32K / 64K,
+i.e. 70% / 63% per-draft acceptance against 78% / 82%). Swapping the document for verbatim-repeated or random-words
+text moves our acceptance only between 60% and 67%, so it is not our text being harder - their drafter's proposals
+land better on their engine (0.1.43) than ours do on 0.1.54, with the same draft head file.
+
 
 
 The fork's posted 32K prefill (3511 tok/s) and decode (100.6 tok/s) on a 7900 XTX with a Zen2 / PCIe 3 host (lcz.me
@@ -191,9 +239,11 @@ Do not port a switch without its measurement: the fork itself records `PREFILL_R
 `RDNA_IQ3S` kernel as "correct but slower than the native kernel at T >= 2", which is what a port looks like when the
 number was taken before the code was kept.
 
-Status: `SPEC_CUM` (§2a) and the three decode fusions (§2b) are ported and measured; the fusions did not clear the
-gate and stay off, `SPEC_CUM=0.4` is deployed. The CPU IQ3_S byte-plane kernel, `PA_KLDS` /
-`PREFILL_MMQ_TILE_ROWS`, `RDNA_MMVQ_WAVE` / `RDNA_Q6K` and the `GR_*` group are still to do, in that order.
+Status: `SPEC_CUM` (§2a), the three decode fusions (§2b) and the K-quant GEMV (§2c) are ported and measured; the
+fusions did not clear the gate and stay off, `SPEC_CUM=0.4` and `STRATA_RDNA_Q6K=1` are deployed. §2d lists what did
+not move the number. Still to do: the wave-32 MMVQ layout (`STRATA_RDNA_MMVQ_WAVE`), the `GR_*` int8 hyper-connection
+group, the CPU IQ3_S byte-plane kernel (mostly idle cores here: 4 pool workers cost only 4%), and
+`PA_KLDS` / `PREFILL_MMQ_TILE_ROWS` (prefill).
 
 ## 4. What we did not take, and why
 

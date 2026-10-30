@@ -59,3 +59,18 @@ bfuse-c2	160000	97.85	27.10	72.9	strata-sc117-iq3_s.json	prod + COMBINE_CPU=1
 bfuse-c3	160000	97.50	27.10	72.5	strata-sc117-iq3_s.json	prod + COMBINE_CPU=1 FUSE_WAIT=1
 bfuse-c3b	160000	96.50	26.67	69.8	strata-sc117-iq3_s.json	prod + COMBINE_CPU=1 FUSE_WAIT=1
 bfuse-c3c	160000	97.30	26.90	72.0	strata-sc117-iq3_s.json	prod + COMBINE_CPU=1 FUSE_WAIT=1
+q6k-off	160000	95.70	27.28	70.7	strata-sc117-iq3_s.json	prod
+q6k-off-b	160000	94.25	27.76	71.2	strata-sc117-iq3_s.json	prod
+q6k-on	160000	97.40	26.54	71.8	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1
+q6k-on-b	160000	99.15	26.22	71.4	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1
+q6k-nw1	160000	98.50	26.67	74.3	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1 MMVQ_SMALLK_NW=1
+q6k-nw2	160000	98.10	26.72	72.0	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1 MMVQ_SMALLK_NW=2
+q6k-packed	160000	100.45	27.30	72.1	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1 Q6_PACKED=1
+q6k-packed-b	160000	96.65	26.62	68.7	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1 Q6_PACKED=1
+q6k-packed-c	160000	98.85	26.76	73.2	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1 Q6_PACKED=1
+q6k-ctl2	160000	96.30	27.56	69.5	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1
+gnpp1	160000	95.40	27.16	70.1	strata-sc117-iq3_s.json	prod + GDN_PP=1
+sh0q6	160000	95.65	27.42	71.8	strata-sc117-iq3_s.json	prod + SH_STREAM=0 GPU_MAX_HW_QUEUES=6
+pw4	160000	91.85	27.92	72.2	ab/cfg-w4.json	prod, pool-workers 4
+pw8	160000	94.80	27.71	72.5	ab/cfg-w8.json	prod, pool-workers 8
+cost6	160000	94.55	29.59	66.6	ab/cfg-spec6b.json	prod + SPEC_COST=1

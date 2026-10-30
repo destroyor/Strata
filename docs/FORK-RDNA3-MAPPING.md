@@ -48,24 +48,34 @@ STRATA_VERIFY_QDEDUP=1 STRATA_KV_HOST_DMA=1 STRATA_PF_FUSED=1 STRATA_PF_GEMM=1 \
 STRATA_PF_PAD=1 STRATA_PF_HCDOWN=1
 ```
 
-**Not deployed yet.** The gain is real but it is not free, and one run of the set produced no answer:
+**Deployed on 2026-10-30** as the production unit's environment (engine 0.1.54 from this repo), with one addition the
+forum's list has and this engine implements differently: `STRATA_HIP_WMMA` works on gfx1100 (the prompt attention on
+matrix cores), while `STRATA_SELECT_WMMA` (the QSA block scorer on matrix cores) in v0.2.8 is gfx12-only, so that half
+of the fork's WMMA advantage is not available here.
 
-- **Prefill** on this fork's base (engine 0.1.54, oct3, production config, 4 reps, `perf/raw/perf-fa54-*.jsonl`):
-  1864 → 2108 tok/s at 32K (+13.1%) and 1787 → 2008 at 96K (+12.4%). Decode shows no consistent change (ms per
-  forward 28.22 → 25.33 at 32K, 26.68 → 26.11 at 96K; the 16-prompt harness measured 90.0 → 82.1 tok/s in one run
-  each, which the per-forward numbers do not support - that harness is the noisier of the two).
-- **Quality** (`perf/knob-quality.txt`): the stdin `run` path (one token per call, CPU experts, 4,995 positions) is
-  bitwise identical with and without the set. The batched prompt path (20 prompts of 256-1,000 tokens, 1,500 GPU
-  experts) keeps top-1 on all 20 prompt ends, with mean KL 0.0138 to the unswitched run (median 0.00026, max 0.134);
-  the two halves alone are 0.0105 and 0.0121. For scale: oct3 with its window is 0.0185 and k8v4 0.0396 on the KV
-  yardstick. So the set buys 12.5% prefill for a prompt-path distribution shift of the order of a KV format change,
-  which is a policy decision, not a free win.
-- **One hang**: the first all-ten run answered nothing on its first 256-token prompt (no error line; the harness
-  killed it). Two halves and a retry of the full set completed; treat it as a cold-start flake until it recurs.
+Measured on this box, oct3, production config, 4 reps (`perf/raw/perf-fa54-*.jsonl`):
 
-If the trade is taken, the arm to ship is the ten switches above plus `STRATA_PREFILL_RING=192`,
-`STRATA_PREFILL_CPU_SHARE=auto`, `STRATA_PREFILL_CPU_SHARE_MAX=6144`, and it should be re-run through all three
-harnesses plus a needle pass on this engine before the production unit names it.
+| arm | 32K prefill | 96K prefill |
+|---|---|---|
+| base | 1864 | 1787 |
+| the ten arithmetic switches + the staging ring | 2108 | 2008 |
+| + `HIP_WMMA` | 2090 | 1928 |
+| + GDN / `PF_F16` / `PREFILL_AUTO_MAX` / `STAGER_RING` | **2243** | 1979 |
+
+So the forum's 2x is, on this engine, +13% from the prompt fusion/GEMM/CPU-share group and another +6% from the GDN
+chunked recurrence and the staging/chunk group; the matrix-core prompt attention adds nothing measurable on this model
+(it does engage - `strata: STRATA_HIP_WMMA: the prompt attention on matrix cores on (gfx1100)`). The rest of their
+2x sits in code that v0.2.8 does not have: `SELECT_WMMA` on gfx11, `PA_KLDS`, `PREFILL_MMQ_TILE_ROWS`,
+`PF_GROUP_RES`, and the `--ple-io direct` + row-cache pairing.
+
+Quality (`perf/knob-quality.txt`): the stdin `run` path is bitwise identical with and without the set; the batched
+prompt path keeps top-1 on all 20 prompts with mean KL 0.0138 (13-switch half) and 0.0170 (full set) against the
+unswitched run (median 0.0005, max 0.125). For scale: oct3 with its window is 0.0185 on the KV yardstick.
+
+One crash: a run with `--stats` stalled at the first prompt chunk's layer 0 and the engine's watchdog aborted it 60 s
+later (ABRT from `strata-watchdog`; `no progress for 60 s ... stopping the engine so the server starts it again`).
+Not reproduced in four other runs of the same switches without `--stats`, including the 16-prompt harness that the
+deployed unit passes with 0 stalls. Deployed without `--stats`, with `LimitCORE=0` in the unit so no core is written.
 
 ## 2. What upstream does not have, and its status in v0.2.8
 

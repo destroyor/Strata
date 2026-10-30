@@ -42,3 +42,4 @@ facc-cum40	160000	93.05	30.49	66.3	cfg-fork-accel.json	STRATA_SPEC_CUM=0.4
 facc-cum40b	160000	93.55	30.36	66.3	cfg-fork-accel.json	STRATA_SPEC_CUM=0.4
 facc-cum60	160000	90.00	28.01	72.8	cfg-fork-accel.json	STRATA_SPEC_CUM=0.6
 facc-knobs	160000	82.10	33.17	63.4	cfg-fork-accel.json	the 13 switches of docs/FORK-RDNA3-MAPPING.md §1
+prod-deployed	160000	95.60	29.52	67.3	strata-sc117-iq3_s.json	the deployed unit: 22 switches + STRATA_SPEC_CUM=0.4

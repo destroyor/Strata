@@ -112,6 +112,36 @@ The switch set of `docs/FORK-RDNA3-MAPPING.md` §1 adds +13% / +12% prefill on t
 (`perf-fa54-knobs.jsonl`: 2108 / 2008 tok/s, 25.33 / 26.11 ms per forward). It is available as an opt-in environment
 file, `perf/presets/gfx1100-prefill.env`, with the quality numbers that come with it.
 
+## Deployed on the box (2026-10-30)
+
+Engine 0.1.54 from this repo (`oct3` + `STRATA_SPEC_CUM` + the rows1 commit), the unit's 22 switches, production
+config (`--kv oct3 --kv-resident 65536 --prefill auto:32768 --spec 5 --spec-min-p 0.5`), `STRATA_SPEC_CUM=0.4`.
+
+| stage | prefill 32K | prefill 96K | 16-prompt decode |
+|---|---|---|---|
+| 0.1.49.2 production (the old engine) | 1880 | 1794 | 90.00 / 90.65 |
+| 0.1.54, no switches | 1864 | 1787 | 90.00 |
+| + the ten arithmetic switches and the staging ring (13) | 2108 | 2008 | 90.4-90.8 |
+| + `STRATA_SPEC_CUM=0.4` | 2108 | 2008 | 93.05 / 93.55 |
+| + `HIP_WMMA` | 2090 | 1928 | - |
+| + GDN / `PF_F16` / `PREFILL_AUTO_MAX` / `STAGER_RING` (the full set) | 2243 | 1979 | - |
+| **deployed: full set + `SPEC_CUM=0.4`** | **2243** | **1979** | **95.60** (0 stalls, `perf/raw/tps2-prod-deployed.txt`) |
+
+The deployed service, measured through its own API on cold 35,946-token prompts (no cache reuse):
+1,971 / 2,010 / 2,012 tok/s (`strata serve: prompt 35946 tokens = 0 reused + 35946 read in ...`), the first request
+of a fresh engine 1,529 tok/s (library warm-up).
+
+Where the prefill comes from, switch group by switch group: the prompt fusion/GEMM/CPU-share group is +13%, the GDN
+chunked recurrence and the staging-ring/auto-chunk group another +6%, and `HIP_WMMA` (the prompt attention on matrix
+cores) nothing measurable on this model - the log does confirm it engages
+(`strata: STRATA_HIP_WMMA: the prompt attention on matrix cores on (gfx1100)`).
+
+**One crash, understood**: a run with `--stats` stalled at the first prompt chunk's layer 0, and the engine's own
+watchdog aborted it 60 s later (`Signal 6 (ABRT) si_code: SI_TKILL`, thread `strata-watchdog`; the serve log says
+`no progress for 60 s ... stopping the engine so the server starts it again (issue #29)`). It left a 31.6 GB core
+because that test ran as root (the unit sets `LimitCORE=0`). Not reproduced in four other runs of the same switches
+without `--stats`, including two 38.6K-token prompts in one session and the 16-prompt harness above.
+
 ## Quality
 
 `perf/kl-tables.txt` (produced by `tools/quant_quality.py compare`), repeated in `docs/OCT3.md`. Reference is the same

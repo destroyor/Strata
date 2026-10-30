@@ -911,9 +911,9 @@ void usage() {
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
                  "                       (vs int8's 1,056); streams with --kv-resident too\n"
                  "  --kv oct3            3-bit Lloyd-Max codes, 448 B/cell (55%% of k8v4, 78%% of q4_0), with an\n"
-                 "                       fp16 window (4 sinks + 64 tail cells per layer). Experimental: needs\n"
-                 "                       --prefill 8192 (a 16384-token chunk has hung on gfx1100), quality anchor\n"
-                 "                       is needle 128k 6/6 on this box; gather path only (no fused decode kernel)\n"
+                 "                       fp16 window (4 sinks + 1024 tail cells per layer by default, STRATA_KV_WINDOW,\n"
+                 "                       STRATA_KV_WINDOW_SINKS/TAIL). Experimental; gather path only (no fused decode\n"
+                 "                       kernel). Measured on gfx1100: docs/OCT3.md\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
@@ -3737,20 +3737,19 @@ int main(int argc, char** argv) {
         return 2;
     }
     strata::core::qsa_set_kv_int8(o.kv == "int8");
-    // STRATA_KV_OCT=1: 3-bit Lloyd-Max K/V (kv_octave.hpp), 448 B per cell. Opt-in until the exact window and the
-    // quality numbers are in; it reads through the gather path (there is no fused decode-attention variant yet).
+    // STRATA_KV_OCT=1: 3-bit Lloyd-Max K/V (kv_octave.hpp), 448 B per cell, reads through the gather path (there is
+    // no fused decode-attention variant yet). The fp16 exact window (4 sinks + 1024 tail cells per layer) is on by
+    // default; STRATA_KV_WINDOW=0 turns it off, STRATA_KV_WINDOW_SINKS/TAIL size it.
     const char* kv_oct_env = std::getenv("STRATA_KV_OCT");
     const bool kv_oct_env_on = kv_oct_env != nullptr && kv_oct_env[0] == '1';
     const bool kv_oct_on = o.kv == "oct3" || kv_oct_env_on;
     strata::core::qsa_set_kv_oct(kv_oct_on);
     if (kv_oct_on) {
-        std::fprintf(stderr, "strata generate: %s: 3-bit Lloyd-Max K/V (448 B/cell, gather path; an fp16 window of 4 "
-                             "sinks + 64 tail cells per layer)\n",
-                     o.kv == "oct3" ? "--kv oct3" : "STRATA_KV_OCT=1");
-        if (o.prefill_chunk > 8192)
-            std::fprintf(stderr, "strata generate: --kv oct3 with a prompt chunk of %lld tokens: a chunk of 16384 or "
-                                 "more has hung on gfx1100 (a staging-path stall); use --prefill 8192 while that is open\n",
-                         (long long) o.prefill_chunk);
+        int ws = 0, wt = 0;
+        strata::core::qsa_window_sizes(ws, wt);
+        std::fprintf(stderr, "strata generate: %s: 3-bit Lloyd-Max K/V (448 B/cell, gather path; an fp16 window of %d "
+                             "sinks + %d tail cells per layer)\n",
+                     o.kv == "oct3" ? "--kv oct3" : "STRATA_KV_OCT=1", ws, wt);
     }
     strata::core::qsa_set_kv_q4(o.kv == "q4_0" && !kv_oct_on);   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
     // STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation --kv q4_0 already uses. Opt-in: first-token KL to

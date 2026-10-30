@@ -48,3 +48,5 @@ spec3	160000	92.05	24.55	75.1	ab/cfg-spec3.json	SPEC_CUM=0.4
 spec8	160000	89.00	35.36	58.0	ab/cfg-spec8.json	SPEC_CUM=0.4
 spec5cum50	160000	93.95	29.04	70.4	strata-sc117-iq3_s.json	SPEC_CUM=0.5
 spec6	160000	88.70	38.67	61.9	ab/cfg-spec6.json	SPEC_CUM=0.4
+spec4	160000	95.50	27.41	70.7	ab/cfg-spec4.json	SPEC_CUM=0.4
+spec4cum50	160000	95.30	26.98	74.2	ab/cfg-spec4.json	SPEC_CUM=0.5

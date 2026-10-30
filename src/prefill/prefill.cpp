@@ -4144,6 +4144,48 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
                     // V dequantized from its q4_0 blocks to fp16 at gather)
                     static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
+                    // STRATA_PA_OCT_CHECK=N (debug): the matrix-core kernel and the FP32 chunk kernel on the same
+                    // N queries of this chunk, compared elementwise.  Prints on the first two QSA layers; off in
+                    // production.
+                    if (!old_attn) {
+                        static const int oct_chk = [] { const char* e = std::getenv("STRATA_PA_OCT_CHECK"); return e ? std::atoi(e) : 0; }();
+                        if (oct_chk > 0 && qsa_index < 2) {
+                            const int64_t nq = std::min<int64_t>(oct_chk, T);
+                            const int64_t zw = s.n_head * s.head_dim;
+                            float *ca = nullptr, *cb = nullptr, *csc = nullptr;
+                            cudaMalloc(&ca, (size_t) (nq * zw) * 4);
+                            cudaMalloc(&cb, (size_t) (nq * zw) * 4);
+                            cudaMalloc(&csc, (size_t) 32 * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s) * 4);
+                            const bool ok_a = strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev,
+                                                                                    m.cap, s, ca, nq, m.cs);
+                            for (int64_t t0 = 0; t0 < nq; t0 += 32)
+                                strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
+                                                                       m.steps_dev + t0 * strata::kernels::kStepCount,
+                                                                       m.cap, s, csc, cb + t0 * ZV,
+                                                                       std::min<int64_t>(32, nq - t0), m.cs);
+                            cudaStreamSynchronize(m.cs);
+                            std::vector<float> ha((size_t) (nq * zw)), hb(ha.size());
+                            cudaMemcpy(ha.data(), ca, ha.size() * 4, cudaMemcpyDeviceToHost);
+                            cudaMemcpy(hb.data(), cb, hb.size() * 4, cudaMemcpyDeviceToHost);
+                            double mx = 0, scale = 0;
+                            int64_t worst = -1;
+                            for (int64_t i = 0; i < nq; ++i) {
+                                double qmx = 0;
+                                for (int64_t j = 0; j < zw; ++j) {
+                                    const double va = ha[(size_t) (i * zw + j)], vb = hb[(size_t) (i * zw + j)];
+                                    qmx = std::max(qmx, std::fabs(va - vb));
+                                    scale = std::max(scale, std::fabs(vb));
+                                }
+                                if (qmx > mx) { mx = qmx; worst = i; }
+                            }
+                            std::fprintf(stderr, "strata PA check (%s): layer %lld p0=%lld, %lld queries: matrix cores %s, "
+                                                 "max |new-old| %.3g of scale %.3g (%.2g), worst query %lld\n",
+                                         pools.oct3 ? "oct3" : "int8", (long long) qsa_index, (long long) p0,
+                                         (long long) nq, ok_a ? "used" : "refused",
+                                         mx, scale, scale > 0 ? mx / scale : 0.0, (long long) worst);
+                            cudaFree(ca); cudaFree(cb); cudaFree(csc);
+                        }
+                    }
                     // STRATA_PATTN_SM60=1 (qsa_pattn.hpp, sm_6x, int8 K/V): the decode kernels' output bit for bit from a
                     // score kernel and a value kernel that merges as it folds (no partials, no merge kernel), ~100
                     // queries a batch in the same scratch; any refusal or launch failure runs the loop below

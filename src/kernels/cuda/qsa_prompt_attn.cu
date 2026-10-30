@@ -11,6 +11,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_octave.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1919,7 +1920,9 @@ struct alignas(16) SmemW {
     float part[4][16][WCH + 1];  // q.k per dim group
     float p[16][WCH + 1];
     float vs[4][WCH];            // V scale per (group, cell)
+    float vsb[4][WCH];           // oct3 only: the wave's second 32-dim group's V scale
     int valid[WCH];              // the cell has a resident pool row
+    int wrow[WCH];               // oct3 only: the exact window's row of the cell, -1 = read the codes
     uint8_t v[4][WCH][WVS];      // per wave: the chunk's V codes of its group, one row per cell
     float qmax[4];
     float alpha[16];
@@ -1945,10 +1948,54 @@ __device__ __forceinline__ wh8 i8_to_h(const uint32_t* x) {   // PA_KL codes, ex
     return h;
 }
 
+// ---- oct3 (`--kv oct3`, kv_octave.hpp) on the same matrix cores.  The 3-bit Lloyd-Max codes are expanded to their
+// int8 levels (units of 1/32) here and travel through the int8 path's staging and fragments; the block's scale d is
+// applied in FP32 after the MMA.  oct3 carries one d per 32 dims where int8 carries one per 64, so a wave (64 dims)
+// has two groups: two q.k partial sets (added after the MMA) and two p.v A fragments (one per 32-dim half).
+// The codebook as bytes, so a v_perm_b32 maps four codes to four levels at once.
+constexpr uint32_t kOctLv0 = (uint32_t) (uint8_t) kOctLevel[0] | ((uint32_t) (uint8_t) kOctLevel[1] << 8) |
+                             ((uint32_t) (uint8_t) kOctLevel[2] << 16) | ((uint32_t) (uint8_t) kOctLevel[3] << 24);
+constexpr uint32_t kOctLv1 = (uint32_t) (uint8_t) kOctLevel[4] | ((uint32_t) (uint8_t) kOctLevel[5] << 8) |
+                             ((uint32_t) (uint8_t) kOctLevel[6] << 16) | ((uint32_t) (uint8_t) kOctLevel[7] << 24);
+
+// four codes, one nibble of each bit-plane, -> four level bytes (value j in byte j).  v_perm_b32 selects byte
+// (sel & 7) of the 8-byte {second, first} operand pair on this toolchain (measured: __builtin_amdgcn_perm(a, b, 0..7)
+// gives b's bytes 0-3 then a's 0-3), so the low half of the codebook is the builtin's second argument.
+__device__ __forceinline__ uint32_t oct_lv4(uint32_t a, uint32_t b, uint32_t c) {
+    const uint32_t m = 0x00204081u, k = 0x01010101u;
+    return __builtin_amdgcn_perm(kOctLv1, kOctLv0, ((a * m) & k) | (((b * m) & k) << 1) | (((c * m) & k) << 2));
+}
+
+// one 16-value half-block (the three 16-bit bit-plane halves) as the 16 fp16 levels the MMA takes
+__device__ __forceinline__ wh8 oct_k16(uint32_t p0, uint32_t p1, uint32_t p2) {
+    wh8 h;
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        const int sh = 4 * g;
+        const uint32_t lv = oct_lv4((p0 >> sh) & 0xFu, (p1 >> sh) & 0xFu, (p2 >> sh) & 0xFu);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) h[4 * g + i] = (_Float16) (int) (int8_t) (lv >> (8 * i));
+    }
+    return h;
+}
+
+// one 32-value oct3 block as eight dwords of level bytes (the p.v staging row)
+__device__ __forceinline__ void oct_planes32(uint32_t p0, uint32_t p1, uint32_t p2, uint32_t* out) {
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        const int sh = 4 * g;
+        out[g] = oct_lv4((p0 >> sh) & 0xFu, (p1 >> sh) & 0xFu, (p2 >> sh) & 0xFu);
+    }
+}
+
+__device__ __forceinline__ float oct_scale(const uint8_t* blk) {   // the block's d, folded with the codebook's 1/32
+    return __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(blk))) * (1.0f / 32.0f);
+}
+
 // SPLIT = true (default): q and p carried as FP16 hi + lo pairs (two WMMAs each: FP32-level). S23 (opt-in
 // STRATA_PA_FAST=1): SPLIT = false, one FP16 image each - half the matrix work, rounding-level (FP16 attention as the
 // usual flash-attention kernels), quality-gated
-template <bool SPLIT>
+template <bool SPLIT, bool OCT>
 __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                                    const int32_t* __restrict__ ids,
                                                                    const int32_t* __restrict__ steps, int n_kv_heads,
@@ -2020,64 +2067,135 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
         return r;
     };
     // a chunk's global reads: this wave's V slice (64 bytes of each row) and V scale, and the K fragments (8 or 16
-    // consecutive codes per lane) and K scales of its two 16-cell tiles
+    // consecutive codes per lane) and K scales of its two 16-cell tiles.  oct3 (`--kv oct3`, kv_octave.hpp): the two
+    // 32-dim blocks of this wave's row slice - 14 bytes each, of which an arm takes 2 scale bytes and 6 code bytes -
+    // and one scale per 32-dim group (`ksc[nt][0..1]`, `vsc`/`vscb`).
+    constexpr int OBH = (HD / QK_OCT) * (int) sizeof(block_oct3);   // oct3 bytes per head per cell
+    constexpr int OBLK = (int) sizeof(block_oct3);
     struct Chunk {
         long long row;
         uint4 v[4];
-        float vsc, ksc[2];
+        float vsc, vscb;
+        float ksc[2][2];
         uint32_t kx[2][4][PA_KL / 4];
+        uint16_t kp[2][4][3];   // oct3: this arm's 16 values, one 16-bit bit-plane each
+        uint16_t vp[2][6];      // oct3: this wave's V slice, the two blocks' 12 code bytes (6 halfwords each)
     };
     auto fetch = [&](long long row, Chunk& d) {
         d.row = row;
-        d.v[0] = d.v[1] = d.v[2] = d.v[3] = make_uint4(0, 0, 0, 0);
-        d.vsc = 0.0f;
-        if (row >= 0) {
-            const uint4* src = reinterpret_cast<const uint4*>(p.v_q + row * HD + dim0);
-            d.v[0] = __ldg(src); d.v[1] = __ldg(src + 1); d.v[2] = __ldg(src + 2); d.v[3] = __ldg(src + 3);
-            d.vsc = __half2float(__ushort_as_half(__ldg(p.v_scale + row * (HD / KV_Q8_GROUP) + warp)));
+        d.vsc = d.vscb = 0.0f;
+        if constexpr (OCT) {
+            if (row >= 0) {
+                const uint8_t* vb = p.v_q4 + row * OBH + (2 * warp) * OBLK;
+                d.vsc = oct_scale(vb);
+                d.vscb = oct_scale(vb + OBLK);
+#pragma unroll
+                for (int g = 0; g < 2; ++g) {
+                    const uint16_t* hp = reinterpret_cast<const uint16_t*>(vb + g * OBLK + 2);
+#pragma unroll
+                    for (int i = 0; i < 6; ++i) d.vp[g][i] = __ldg(hp + i);
+                }
+            } else {
+#pragma unroll
+                for (int g = 0; g < 2; ++g)
+#pragma unroll
+                    for (int i = 0; i < 6; ++i) d.vp[g][i] = 0;
+            }
+        } else {
+            d.v[0] = d.v[1] = d.v[2] = d.v[3] = make_uint4(0, 0, 0, 0);
+            if (row >= 0) {
+                const uint4* src = reinterpret_cast<const uint4*>(p.v_q + row * HD + dim0);
+                d.v[0] = __ldg(src); d.v[1] = __ldg(src + 1); d.v[2] = __ldg(src + 2); d.v[3] = __ldg(src + 3);
+                d.vsc = __half2float(__ushort_as_half(__ldg(p.v_scale + row * (HD / KV_Q8_GROUP) + warp)));
+            }
         }
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
             const long long rr = __shfl(row, nt * 16 + col);
-            d.ksc[nt] = 0.0f;
-            if (rr >= 0) d.ksc[nt] = __half2float(__ushort_as_half(__ldg(p.k_scale + rr * (HD / KV_Q8_GROUP) + warp)));
-#pragma unroll
-            for (int kk = 0; kk < 4; ++kk) {
-#pragma unroll
-                for (int i = 0; i < PA_KL / 4; ++i) d.kx[nt][kk][i] = 0;
+            d.ksc[nt][0] = d.ksc[nt][1] = 0.0f;
+            if constexpr (OCT) {
                 if (rr >= 0) {
-                    const uint32_t* src = reinterpret_cast<const uint32_t*>(p.k_q + rr * HD + dim0 + kk * 16 + PA_KOFF(half));
+                    const uint8_t* kb = p.k_q4 + rr * OBH + (2 * warp) * OBLK;
+                    d.ksc[nt][0] = oct_scale(kb);
+                    d.ksc[nt][1] = oct_scale(kb + OBLK);
+#pragma unroll
+                    for (int kk = 0; kk < 4; ++kk) {
+                        const uint16_t* hp = reinterpret_cast<const uint16_t*>(kb + (kk >> 1) * OBLK + 2 + (kk & 1) * 2);
+                        d.kp[nt][kk][0] = __ldg(hp + 0);
+                        d.kp[nt][kk][1] = __ldg(hp + 2);
+                        d.kp[nt][kk][2] = __ldg(hp + 4);
+                    }
+                } else {
+#pragma unroll
+                    for (int kk = 0; kk < 4; ++kk) d.kp[nt][kk][0] = d.kp[nt][kk][1] = d.kp[nt][kk][2] = 0;
+                }
+            } else {
+                if (rr >= 0) d.ksc[nt][0] = __half2float(__ushort_as_half(__ldg(p.k_scale + rr * (HD / KV_Q8_GROUP) + warp)));
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk) {
+#pragma unroll
+                    for (int i = 0; i < PA_KL / 4; ++i) d.kx[nt][kk][i] = 0;
+                    if (rr >= 0) {
+                        const uint32_t* src = reinterpret_cast<const uint32_t*>(p.k_q + rr * HD + dim0 + kk * 16 + PA_KOFF(half));
 #if STRATA_PA_GFX11
-                    const uint4 v = __ldg(reinterpret_cast<const uint4*>(src));
-                    d.kx[nt][kk][0] = v.x; d.kx[nt][kk][1] = v.y; d.kx[nt][kk][2] = v.z; d.kx[nt][kk][3] = v.w;
+                        const uint4 v = __ldg(reinterpret_cast<const uint4*>(src));
+                        d.kx[nt][kk][0] = v.x; d.kx[nt][kk][1] = v.y; d.kx[nt][kk][2] = v.z; d.kx[nt][kk][3] = v.w;
 #else
-                    const uint2 v = __ldg(reinterpret_cast<const uint2*>(src));
-                    d.kx[nt][kk][0] = v.x; d.kx[nt][kk][1] = v.y;
+                        const uint2 v = __ldg(reinterpret_cast<const uint2*>(src));
+                        d.kx[nt][kk][0] = v.x; d.kx[nt][kk][1] = v.y;
 #endif
+                    }
                 }
             }
         }
     };
     auto chunk = [&](const Chunk& cd) {
-        // stage this wave's V slice and scale
+        // stage this wave's V slice and scale (oct3: both 32-dim blocks' codes expanded to their int8 levels here, once
+        // per value, and both scales)
         {
             uint4* dst = reinterpret_cast<uint4*>(&S.v[warp][lane][0]);
-            dst[0] = cd.v[0]; dst[1] = cd.v[1]; dst[2] = cd.v[2]; dst[3] = cd.v[3];
-            S.vs[warp][lane] = cd.vsc;
+            if constexpr (OCT) {
+                uint32_t lv[16];
+                oct_planes32(cd.vp[0][0] | ((uint32_t) cd.vp[0][1] << 16), cd.vp[0][2] | ((uint32_t) cd.vp[0][3] << 16),
+                             cd.vp[0][4] | ((uint32_t) cd.vp[0][5] << 16), lv);
+                oct_planes32(cd.vp[1][0] | ((uint32_t) cd.vp[1][1] << 16), cd.vp[1][2] | ((uint32_t) cd.vp[1][3] << 16),
+                             cd.vp[1][4] | ((uint32_t) cd.vp[1][5] << 16), lv + 8);
+                dst[0] = make_uint4(lv[0], lv[1], lv[2], lv[3]);
+                dst[1] = make_uint4(lv[4], lv[5], lv[6], lv[7]);
+                dst[2] = make_uint4(lv[8], lv[9], lv[10], lv[11]);
+                dst[3] = make_uint4(lv[12], lv[13], lv[14], lv[15]);
+                S.vs[warp][lane] = cd.vsc;
+                S.vsb[warp][lane] = cd.vscb;
+            } else {
+                dst[0] = cd.v[0]; dst[1] = cd.v[1]; dst[2] = cd.v[2]; dst[3] = cd.v[3];
+                S.vs[warp][lane] = cd.vsc;
+            }
             if (warp == 0) S.valid[lane] = cd.row >= 0;
         }
         // q.k over this wave's 64 dims for two 16-cell tiles, times the cell's K scale for this group
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
             wf8 s = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            wf8 s2 = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};   // oct3: the wave's second 32-dim group
 #pragma unroll
             for (int kk = 0; kk < 4; ++kk) {
-                const wh8 b = i8_to_h(cd.kx[nt][kk]);
-                s = wmma_f16(qh[kk], b, s);
-                if constexpr (SPLIT) s = wmma_f16(ql[kk], b, s);
+                wh8 b;
+                if constexpr (OCT) b = oct_k16(cd.kp[nt][kk][0], cd.kp[nt][kk][1], cd.kp[nt][kk][2]);
+                else b = i8_to_h(cd.kx[nt][kk]);
+                if (OCT && kk >= 2) {
+                    s2 = wmma_f16(qh[kk], b, s2);
+                    if constexpr (SPLIT) s2 = wmma_f16(ql[kk], b, s2);
+                } else {
+                    s = wmma_f16(qh[kk], b, s);
+                    if constexpr (SPLIT) s = wmma_f16(ql[kk], b, s);
+                }
             }
 #pragma unroll
-            for (int i = 0; i < 8; ++i) S.part[warp][PA_ROW(i, half)][nt * 16 + col] = s[i] * cd.ksc[nt];
+            for (int i = 0; i < 8; ++i) {
+                float v = s[i] * cd.ksc[nt][0];
+                if constexpr (OCT) v += s2[i] * cd.ksc[nt][1];
+                S.part[warp][PA_ROW(i, half)][nt * 16 + col] = v;
+            }
         }
         __syncthreads();
         // online softmax over the four groups' sum (fixed order): row t/8, 4 cells per thread
@@ -2116,6 +2234,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
         // p.v over this wave's 64 dims: 4 tiles of 16 dims, 2 k-steps of 16 cells
         {
             float vmax = S.vs[warp][lane];
+            if constexpr (OCT) vmax = fmaxf(vmax, S.vsb[warp][lane]);
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
             const float vup = vmax > 0.0f ? 16384.0f / vmax : 0.0f, vdown = vmax * (1.0f / 16384.0f);
@@ -2125,13 +2244,19 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
 #pragma unroll
             for (int ks = 0; ks < 2; ++ks) {
                 const int cb = ks * 16 + PA_KOFF(half);   // this lane's PA_KL cells
-                wh8 ah, al;
+                wh8 ah, al, bh, bl;                       // oct3: one A per 32-dim group (its own scale)
 #pragma unroll
                 for (int i = 0; i < PA_KL; ++i) {
                     const float pv = S.p[col][cb + i] * (S.vs[warp][cb + i] * vup);
                     const _Float16 hi = (_Float16) pv;
                     ah[i] = hi;
                     al[i] = (_Float16) (pv - (float) hi);
+                    if constexpr (OCT) {
+                        const float pv2 = S.p[col][cb + i] * (S.vsb[warp][cb + i] * vup);
+                        const _Float16 h2 = (_Float16) pv2;
+                        bh[i] = h2;
+                        bl[i] = (_Float16) (pv2 - (float) h2);
+                    }
                 }
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -2139,8 +2264,8 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
                     wh8 b;
 #pragma unroll
                     for (int i = 0; i < PA_KL; ++i) b[i] = (_Float16) (int) (int8_t) S.v[warp][cb + i][d];
-                    tmp[j] = wmma_f16(ah, b, tmp[j]);
-                    if constexpr (SPLIT) tmp[j] = wmma_f16(al, b, tmp[j]);
+                    tmp[j] = wmma_f16(OCT && j >= 2 ? bh : ah, b, tmp[j]);
+                    if constexpr (SPLIT) tmp[j] = wmma_f16(OCT && j >= 2 ? bl : al, b, tmp[j]);
                 }
             }
             float a[8];
@@ -2241,19 +2366,34 @@ bool hip_wmma_usable(int64_t n_q, int64_t cap) {
     return arch == 2 && strata::core::kGfx12PromptDefaultsOn;   // unset: the gfx12 default (Linux; Windows is opt-in until tested there)
 }
 
+// STRATA_PA_OCT=1: the same matrix-core kernel for `--kv oct3` (the 3-bit codes expanded in registers, one scale per
+// 32 dims).  Off until the unpacked path is measured; without it oct3 keeps the decode kernel's gather.
+bool pa_oct_env() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_PA_OCT"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+
+template <bool OCT>
 bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                  const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
+    if constexpr (OCT) {
+        static const bool told = [] {
+            std::fprintf(stderr, "strata: STRATA_PA_OCT: the 3-bit KV prompt attention on matrix cores\n");
+            return true;
+        }();
+        (void) told;
+    }
     const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
     for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
         static const bool fast = [] { const char* e = std::getenv("STRATA_PA_FAST"); return e != nullptr && e[0] == '1'; }();
         static const int64_t min_t = [] { const char* e = std::getenv("STRATA_PF_SWITCH_MIN_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
         if (fast && n_q >= min_t)
-            prompt_attn_wmma_kernel<false><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, 0, st>>>(
+            prompt_attn_wmma_kernel<false, OCT><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, 0, st>>>(
                 q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
                 (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
         else
-            prompt_attn_wmma_kernel<true><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, 0, st>>>(
+            prompt_attn_wmma_kernel<true, OCT><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, 0, st>>>(
                 q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
                 (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
     }
@@ -2375,10 +2515,16 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     // the tensor-core kernels are compiled out on AMD (its major version is not a CUDA sm); RDNA4 has its own int8-KV
     // matrix-core kernel, opt-in (STRATA_HIP_WMMA=1); everything else keeps the old kernel
     (void) turing; (void) volta;
-    if (pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
-        pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
-        cap > 0 && ids && steps && pools.page_table && hip_wmma_usable(n_q, cap))
-        return launch_wmma(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
+    const bool fits = s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv && cap > 0 && ids && steps &&
+                      pools.page_table && hip_wmma_usable(n_q, cap);
+    // oct3: the same kernel with the 3-bit codes expanded in registers (STRATA_PA_OCT=1).  A pool that carries the
+    // exact fp16 window is left to the chunk path: the prompt attention has never read the window (the staged
+    // --kv-resident pools carry none), and it must not silently ignore it where it exists.
+    if (fits && pools.oct3 && pa_oct_env() && pools.k_q4 != nullptr && pools.v_q4 != nullptr && !pools.win.present())
+        return launch_wmma<true>(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
+    if (fits && pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
+        pools.k_q4 == nullptr && pools.v_q4 == nullptr)
+        return launch_wmma<false>(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
     return false;
 #endif
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)

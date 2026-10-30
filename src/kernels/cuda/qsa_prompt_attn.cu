@@ -1922,7 +1922,6 @@ struct alignas(16) SmemW {
     float vs[4][WCH];            // V scale per (group, cell)
     float vsb[4][WCH];           // oct3 only: the wave's second 32-dim group's V scale
     int valid[WCH];              // the cell has a resident pool row
-    int wrow[WCH];               // oct3 only: the exact window's row of the cell, -1 = read the codes
     uint8_t v[4][WCH][WVS];      // per wave: the chunk's V codes of its group, one row per cell
     float qmax[4];
     float alpha[16];
@@ -2055,16 +2054,36 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
 
     const int n_chunks = (n + WCH - 1) / WCH;
     // chunk ci's cell for this lane (lane = cell index): its pool row, or -1 (past the selection, or a block the KV
-    // streaming left non-resident: masked as in the decode kernel)
-    auto row_of = [&](int ci) -> long long {
+    // streaming left non-resident: masked as in the decode kernel).  `w` comes back as the exact window's row of that
+    // cell (-1: read the codes) - the pool a session without --kv-resident hands the prompt path carries it.
+    auto row_of = [&](int ci, int& w) -> long long {
         const int c0 = ci * WCH;
         long long r = -1;
+        w = -1;
         if (c0 + lane < n) {
             const int cell = __ldg(ids + c0 + lane);
             const long long page = (long long) __ldg(p.page_table + cell / page_size);
-            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            if (page >= 0) {
+                r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+                if constexpr (OCT) {
+                    if (p.win.present()) {
+                        const int wr = kv_window_row(p.win, cell);
+                        if (wr >= 0 && __ldg(p.win.tag + wr) == cell) w = wr;
+                    }
+                }
+            }
         }
         return r;
+    };
+    // the exact window's K for one arm: PA_KL consecutive halfs (the same rotated frame the codes are in)
+    auto win_frag = [&](int wr, int d0) -> wh8 {
+        const uint16_t* src = p.win.k + (size_t) wr * (size_t) (p.win.n_head_kv * HD) + (size_t) kvh * HD + (size_t) d0;
+        wh8 h;
+        uint4* dst = reinterpret_cast<uint4*>(&h);
+        const uint4* s4 = reinterpret_cast<const uint4*>(src);
+#pragma unroll
+        for (int j = 0; j < PA_KL / 8; ++j) dst[j] = __ldg(s4 + j);
+        return h;
     };
     // a chunk's global reads: this wave's V slice (64 bytes of each row) and V scale, and the K fragments (8 or 16
     // consecutive codes per lane) and K scales of its two 16-cell tiles.  oct3 (`--kv oct3`, kv_octave.hpp): the two
@@ -2074,6 +2093,8 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
     constexpr int OBLK = (int) sizeof(block_oct3);
     struct Chunk {
         long long row;
+        int wro;                // oct3: the exact window's row of this lane's own cell (V staging), -1 = codes
+        int wr[2];              // oct3: the same for the two 16-cell tiles' cells (the K fragments)
         uint4 v[4];
         float vsc, vscb;
         float ksc[2][2];
@@ -2081,11 +2102,14 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
         uint16_t kp[2][4][3];   // oct3: this arm's 16 values, one 16-bit bit-plane each
         uint16_t vp[2][6];      // oct3: this wave's V slice, the two blocks' 12 code bytes (6 halfwords each)
     };
-    auto fetch = [&](long long row, Chunk& d) {
+    auto fetch = [&](long long row, int wro, Chunk& d) {
         d.row = row;
+        d.wro = wro;
         d.vsc = d.vscb = 0.0f;
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) d.wr[nt] = __shfl(wro, nt * 16 + col);
         if constexpr (OCT) {
-            if (row >= 0) {
+            if (row >= 0 && wro < 0) {
                 const uint8_t* vb = p.v_q4 + row * OBH + (2 * warp) * OBLK;
                 d.vsc = oct_scale(vb);
                 d.vscb = oct_scale(vb + OBLK);
@@ -2114,7 +2138,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
             const long long rr = __shfl(row, nt * 16 + col);
             d.ksc[nt][0] = d.ksc[nt][1] = 0.0f;
             if constexpr (OCT) {
-                if (rr >= 0) {
+                if (rr >= 0 && d.wr[nt] < 0) {
                     const uint8_t* kb = p.k_q4 + rr * OBH + (2 * warp) * OBLK;
                     d.ksc[nt][0] = oct_scale(kb);
                     d.ksc[nt][1] = oct_scale(kb + OBLK);
@@ -2128,6 +2152,8 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
                 } else {
 #pragma unroll
                     for (int kk = 0; kk < 4; ++kk) d.kp[nt][kk][0] = d.kp[nt][kk][1] = d.kp[nt][kk][2] = 0;
+                    // the exact window holds this tile's cell: its fp16 values go in as they are (scale 1)
+                    if (rr >= 0) d.ksc[nt][0] = d.ksc[nt][1] = 1.0f;
                 }
             } else {
                 if (rr >= 0) d.ksc[nt][0] = __half2float(__ushort_as_half(__ldg(p.k_scale + rr * (HD / KV_Q8_GROUP) + warp)));
@@ -2180,8 +2206,10 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
 #pragma unroll
             for (int kk = 0; kk < 4; ++kk) {
                 wh8 b;
-                if constexpr (OCT) b = oct_k16(cd.kp[nt][kk][0], cd.kp[nt][kk][1], cd.kp[nt][kk][2]);
-                else b = i8_to_h(cd.kx[nt][kk]);
+                if constexpr (OCT) {
+                    b = cd.wr[nt] >= 0 ? win_frag(cd.wr[nt], dim0 + kk * 16 + PA_KOFF(half))
+                                       : oct_k16(cd.kp[nt][kk][0], cd.kp[nt][kk][1], cd.kp[nt][kk][2]);
+                } else b = i8_to_h(cd.kx[nt][kk]);
                 if (OCT && kk >= 2) {
                     s2 = wmma_f16(qh[kk], b, s2);
                     if constexpr (SPLIT) s2 = wmma_f16(ql[kk], b, s2);
@@ -2275,6 +2303,27 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
             for (int j = 0; j < 4; ++j)
 #pragma unroll
                 for (int i = 0; i < 8; ++i) acc[j][i] = fmaf(acc[j][i], a[i], tmp[j][i] * vdown);
+            // oct3: the cells the exact window holds had their codes masked out above (vs = 0); their values go in
+            // here, fp32, as the chunk path reads them - only over the (few) window cells of this chunk
+            if constexpr (OCT) {
+                if (__any(cd.wro >= 0)) {   // this wave's own rows: lane = cell, so no shared state to race with
+                    for (int c = 0; c < WCH; ++c) {
+                        const int wr = __shfl(cd.wro, c);
+                        if (wr < 0) continue;
+                        const uint16_t* vrow = p.win.v + (size_t) wr * (size_t) (p.win.n_head_kv * HD) +
+                                               (size_t) kvh * HD + dim0;
+                        float pc[8];
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) pc[i] = S.p[PA_ROW(i, half)][c];
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const float vv = __half2float(__ushort_as_half(vrow[j * 16 + col]));
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) acc[j][i] = fmaf(pc[i], vv, acc[j][i]);
+                        }
+                    }
+                }
+            }
         }
         // no barrier here: `v`/`vs` are this wave's own, and `p`/`alpha`/`valid` are rewritten only after the next
         // chunk's first barrier (which every wave reaches after its p.v)
@@ -2283,7 +2332,9 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
     // staging): 32K context, 2,048 queries, gfx1151, STRATA_PA_FAST=1: 12.49 -> 11.27 ms; the same bits
     for (int ci = 0; ci < n_chunks; ++ci) {
         Chunk d;
-        fetch(row_of(ci), d);
+        int w = -1;
+        const long long row = row_of(ci, w);   // sequenced: `w` is read only after row_of has written it
+        fetch(row, w, d);
         chunk(d);
     }
     float inv[8];
@@ -2518,9 +2569,9 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     const bool fits = s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv && cap > 0 && ids && steps &&
                       pools.page_table && hip_wmma_usable(n_q, cap);
     // oct3: the same kernel with the 3-bit codes expanded in registers (STRATA_PA_OCT=1).  A pool that carries the
-    // exact fp16 window is left to the chunk path: the prompt attention has never read the window (the staged
-    // --kv-resident pools carry none), and it must not silently ignore it where it exists.
-    if (fits && pools.oct3 && pa_oct_env() && pools.k_q4 != nullptr && pools.v_q4 != nullptr && !pools.win.present())
+    // exact fp16 window (a session without --kv-resident) is read through it: the window's cells go in as their fp16
+    // values, the codes serve the rest, exactly as the chunk path reads the two.
+    if (fits && pools.oct3 && pa_oct_env() && pools.k_q4 != nullptr && pools.v_q4 != nullptr)
         return launch_wmma<true>(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
     if (fits && pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
         pools.k_q4 == nullptr && pools.v_q4 == nullptr)

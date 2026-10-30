@@ -156,19 +156,37 @@ is the FP32-level answer. `tools/needle_bench.py` at 32K, depths 10/50/90 (3 sam
 the fast arm on an earlier build of the kernel missed all three, so a 3-sample needle run is not a quality gate for a
 3.5e-4 change; a longer-sampled run is the open item.
 
-**The window guard.** A pool that carries the exact fp16 window (any `--kv oct3` session without `--kv-resident`, where
-the prompt attention reads `qsa_attn_pools(st)` rather than the staged copy) keeps the chunk path: the prompt attention
-has never read the window, and the matrix-core arm would silently ignore cells the chunk path reads exactly. Measured
-without the guard, 4,500-token prompts, full-vocabulary next-token logits: KL 3.0e-3 to 7.0e-2 against the chunk path
-(top-1 the same on all five); with it, the two paths' logits are bit-identical.
+**The exact window in the prompt path.** A session without `--kv-resident` hands the prompt attention
+`qsa_attn_pools(st)`, which carries the window; the staged pools of the production config carry none. The matrix-core
+arm reads it when it is there:
+
+- **K** - the window row's fp16 values go straight in as the arm's B fragment (each lane holds one cell's 16 dims), with
+  the cell's scale 1 instead of the codebook's `d/32`;
+- **V** - the window's cells have their codes masked out (`vs`/`vsb` 0) and their exact values added in FP32 as the
+  chunk's weights settle (4 V reads + 8 weight reads + 32 FMAs per window cell per lane), skipped entirely by a
+  wave-wide vote when a chunk holds none;
+- the window's rows live in registers (`__shfl` over lane = cell), not in shared memory: a shared array is rewritten by
+  the next chunk's staging before the slower waves have finished their p.v.
+
+Measured (`qsa_prompt_attn_parity`, which now runs an `oct3+win` arm beside the others: 4 sinks + 1024 tail rows, hits
+mixed with misses inside a 16-cell tile): every arm passes, and the window arm's output is the FP32 chunk path's -
+which reads the same window - to 1.2e-6-1.6e-6 of scale at 32K, 2.1K and 1.5K contexts. Kernel level, 32K context,
+2,048 queries: 9.44 ms per chunk against 37.2 for the chunk path (3.9x); the window's fp32 additions cost ~10% over
+the 8.60 ms of the no-window arm. End to end, `--kv oct3` without `--kv-resident` (the configuration where the window
+is live): **32K 2,305 -> 3,429 tok/s, 96K 2,298 -> 3,087-3,480** (`perf/raw/perf-nonres-*.jsonl`), 3 of 3 32K needles,
+the same window quality the chunk path had.
+
+Two bugs the parity arms caught while this was built: the window row travelled through an argument of `fetch()` whose
+evaluation order against `row_of()` is unspecified (the row was read as "no hit"), and the shared `wrow[]` array was
+stale-racy (nondeterministic output between two runs of the same arm).
 
 ## What it does not do
 
 - **Gather path + the prompt attention above.** There is no fused decode-attention mode for oct3 (`qsa_decode_attn.cu`
   falls back to the chunk kernel with `KV_MODE == 4`), and no row-batched or slot-batched attention (those exit with a
   message if asked for oct3). `--kv oct3` with `STRATA_BATCH_ATTN_ROWS` or a multi-slot server is refused, not
-  silently misread. The prompt attention takes oct3 only with `STRATA_PA_OCT=1` (`qsa_prompt_attn_batch` otherwise
-  returns false and the caller keeps the chunk path).
+  silently misread. The prompt attention takes oct3 (and its exact window) only with `STRATA_PA_OCT=1`
+  (`qsa_prompt_attn_batch` otherwise returns false and the caller keeps the chunk path).
 - **The MTP drafter stays on plain INT8** (`mtp.cpp`), for the same reason it does under k8v4.
 - **Not a snapshot format.** A slot image never contains the window; restoring invalidates it.
 - **Experimental.** The format is not a default and upstream has not accepted it.

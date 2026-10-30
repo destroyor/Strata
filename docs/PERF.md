@@ -148,6 +148,25 @@ watchdog aborted it 60 s later (`Signal 6 (ABRT) si_code: SI_TKILL`, thread `str
 because that test ran as root (the unit sets `LimitCORE=0`). Not reproduced in four other runs of the same switches
 without `--stats`, including two 38.6K-token prompts in one session and the 16-prompt harness above.
 
+## Where the last 1.5x of prefill is: the prompt-attention kernel
+
+The forum's 3.5K was measured with `--kv int8`. On this engine, with the same 23 switches, the KV format alone decides
+whether the batched (matrix-core) prompt attention runs at all - `qsa_prompt_attn_batch` on AMD takes only int8 pools
+(`k_q`/`v_q`/`k_scale`/`v_scale`, no `k_q4`), everything else falls back to the decode kernel's gather, one window of
+queries at a time. 4 reps, production config, `perf/raw/perf-fmt-*.jsonl`:
+
+| KV | 32K prefill | 96K prefill | 16-prompt decode | cell size |
+|---|---|---|---|---|
+| oct3 (deployed) | 2280 | 2304 | 95.60 tok/s | 448 B |
+| k8v4 | 2307 | 2313 | - | 816 B |
+| **int8** | **3506** | **3559** | 90.75 tok/s | 1056 B |
+
+So the forum's number is reachable exactly: int8 + the 23 switches = 3506 / 3559, the same 2x over a bare build. The
+trade is the KV format: 2.4x the bytes per cell (a smaller expert cache at the same `--kv-resident`), 5% less decode,
+and the 3-bit format's memory saving is gone. Keeping oct3 *and* 3.5K means teaching the matrix-core prompt kernel to
+read 3-bit blocks - it applies one scale per 64 dims while oct3 carries one per 32, so the scale has to be folded into
+the fp16 conversion per element (register pressure), which is a kernel project, not a switch.
+
 ## Quality
 
 `perf/kl-tables.txt` (produced by `tools/quant_quality.py compare`), repeated in `docs/OCT3.md`. Reference is the same

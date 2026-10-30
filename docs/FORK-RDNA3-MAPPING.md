@@ -270,6 +270,29 @@ in the *multi-row* BF16 router GEMV with the gate applied inside the combine (`n
 the aux block there, ours only supports it in the rows kernel). It is one 2560-row matvec and a 2560-element sigmoid
 per layer - unlikely to be the 5.5 ms, but it is the only code left in that group that they run and we do not.
 
+### 2g. Where our own 26.5 ms goes (the engine's own stage table)
+
+0.1.54 prints the window's GPU stage table into the engine log (ms per window, our deployed config, 130 windows):
+
+| stage (GDN layers) | ms | stage (QSA layers) | ms |
+|---|---|---|---|
+| VRAM hits (expert GEMVs) | 2.63 | VRAM hits | 0.90 |
+| **hyper-connection (hc0+hc1: norm/down/up, 6 launches)** | **3.30** | attention | 0.72 |
+| shared+quant | 1.35 | q+q-idx | 0.78 |
+| q8+qkv/q-idx gemv | 1.47 | router+plan+bell | 0.34 |
+| out-proj | 1.02 | shared+quant | 0.45 |
+| router+plan+bell | 1.06 | kv+idx append | 0.31 |
+| head | 0.89 | scores+topk | 0.39 |
+| waitCPU / copy+combine | 0.45 / 0.51 | waitCPU / copy+combine | 0.07 / 0.17 |
+| PCIe grp | 0.38 | PCIe grp | 0.13 |
+| **total, both layer kinds** | **22.95** | | |
+
+The hyper-connection read is the largest single item after the experts: 3.3 ms for 317 MB of BF16 `hc_*` weights per
+forward, i.e. **96 GB/s** - those six small launches are nowhere near bandwidth on this card, which is exactly what the
+fork's `rdna_gr.cu` (2 launches, int8 weights, grid-barrier fused down/up) exists for. It is the next port; on the
+reference engine the GR group made no difference, but their non-rdna GR is the same 0.1.43 path ours came from, and
+the ablation cannot separate "GR is fast on both" from "GR is slow on both".
+
 The fork's posted 32K prefill (3511 tok/s) and decode (100.6 tok/s) on a 7900 XTX with a Zen2 / PCIe 3 host (lcz.me
 topic 2671) also depend on the WMMA prompt attention and QSA selection. This repo's CMake probes **rocWMMA** and
 finds none, so that path cannot be built here as-is; taking it means adding the rocWMMA headers and a gfx1100 build

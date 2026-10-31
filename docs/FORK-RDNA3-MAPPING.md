@@ -453,6 +453,52 @@ the node count matters more than the kernels' shapes. Two consequences measured 
   25.92. A node is not a fixed 7 us: the four the PCIe share owned were a spin wait and a wide empty launch; a
   pair launch as wide as the two it replaces saves only its dispatch.
 
+### 2k. Where the draft's 3.1 ms goes, and five switches closed (2026-10-31, later)
+
+Fresh `STRATA_DRAFT_TIMING=1 STRATA_MTP_PROFILE=1` on the deployed binary at 60K context (600 rounds):
+
+| draft graph | ms | biggest stages |
+|---|---|---|
+| round | 1.451 | attention **0.410**, head 0.269, embed+fc_emb 0.207, q+norm-rope 0.084 |
+| each step (1.46/round) | 1.113 | attention **0.395**, head 0.261, q+norm-rope 0.057, experts 0.048 |
+
+So the draft is 2.46 graphs a window: **attention 0.99 ms (32%) + head 0.65 ms (21%) + small stages 1.4 ms**. Both
+heads are already at their limits (the Q6_K head reads 213 MiB at ~790 GB/s). The draft's attention shares the main
+model's kernel but not its shape: one query row per graph means the 3-bit dequant is amortised over the query heads of
+a single KV head (G), not over several rows, so per byte read it lands at ~37 GB/s against the QSA layers' ~430.
+
+Two numbers that looked like waste and are not:
+
+- `embed+fc_emb` 0.207 in the *round* graph against 0.029 in the *steps*: the round graph's first stage also carries
+  the wait for the verify window's tail (the draft starts inside it), and `STRATA_EMBED_VRAM=1` - the 322 MiB table
+  moved into VRAM - changed it not at all (0.207 -> 0.210). The fc_emb GEMV alone is **10.1 us (689 GB/s)**, now a
+  shape in `q8_gemv_bench` (2560x2560). The old "G3 / 34 GB/s" finding is void.
+- the expert group grid is already grid-stride over groups (`for g = blockIdx.y; g < ng; g += gridDim.y`), so
+  `grid_groups` < cap is legal; the engine keeps the AMD layout (gy = 0, one block row per possible group) on purpose.
+
+Switches measured today on the 32K arm (control: 24.45 ms, 110.2 tok/s, 73.5%), all rejected:
+
+| arm | ms_fwd | verdict |
+|---|---|---|
+| `STRATA_SH_STREAM=1` | 24.12 (111.7) | **no**: the 16-prompt harness reads 79.55 tok/s median (33.55 ms, min 40.5) against 112.55 / 110.95 - exactly the "goes both ways" AMD_HIP.md warns about. Off |
+| `STRATA_FUSE_CONVAB=1` | 24.48 | neutral |
+| `STRATA_FUSE_HITS=1` | 24.71 | neutral |
+| `STRATA_EXPERT_V2=1` | 24.64 | neutral (only the gu_type 21 / n_ff 640 layers take it) |
+| `STRATA_TSUM=1` | 24.56 | neutral |
+| `EXPERT_V2 + TSUM` | 50.00 | 2x slower - never combine them |
+| `STRATA_HC_PERSIST=1 STRATA_QFUSE=0` | 24.95 | worse: the persistent hyper-connection read needs QFUSE off (it refuses a `q8_mixed`), and the 36 quantize nodes that costs outweigh the read's win |
+
+**What one graph node costs, measured with the engine's own instrument.** `STRATA_DUMMY_NODES=k` adds k empty kernels
+per layer, so the difference is pure node overhead: +2 nodes a layer (96 a window) 24.45 -> 24.72, +6 (288) -> 25.24,
+i.e. **2.7 us a node**. That is the exchange rate for any future fusion: 100 nodes = 0.27 ms = 1.1% of the window. It
+also explains why the PCIe share's removal paid 1.4 ms for four nodes a layer: one of the four was a *spin wait* and
+one a wide empty `grouped()` launch, not a no-op.
+
+The remaining structural item is a **persistent expert GEMV**: one fixed grid per window looping over the plan's
+groups drops the empty group rows (cap 30 against ~21 real groups, measured at ~0.2 us a row: ~0.15 ms, 0.6%) but not
+the two launches a layer, since gu and down are dependent and 2400 blocks cannot be co-resident for a grid barrier
+(the same wall `STRATA_GR_FUSED` hit). Low value; not started.
+
 ## 4. What we did not take, and why
 
 - **The fork's tree as a base.** 0.1.43 against 0.1.54 is ~170 commits of upstream work (conversation snapshots,

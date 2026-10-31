@@ -26,6 +26,7 @@ const Shape SHAPES[] = {
     {"QSA q 2560->12288", 2560, 12288},    {"QSA k/v 2560->512", 2560, 512},    {"HC down 10240->320", 10240, 320},
     {"HC up 320->10240", 320, 10240},      {"shared gate/up 2560->640", 2560, 640}, {"shared down 640->2560", 640, 2560},
     {"head 2560->248320", 2560, 248320},
+    {"mtp fc_emb 2560->2560", 2560, 2560}, {"mtp o_proj 4096->2560", 4096, 2560},
 };
 void ck(cudaError_t e, const char* w) {
     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", w, cudaGetErrorString(e)); std::exit(1); }

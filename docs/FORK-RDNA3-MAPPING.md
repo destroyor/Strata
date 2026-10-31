@@ -499,6 +499,26 @@ groups drops the empty group rows (cap 30 against ~21 real groups, measured at ~
 the two launches a layer, since gu and down are dependent and 2400 blocks cannot be co-resident for a grid barrier
 (the same wall `STRATA_GR_FUSED` hit). Low value; not started.
 
+### 2l. `STRATA_GR_RDNA_F16`: gfx1100 HAS the fp16 packed dot, and it is still only 1% (2026-10-31, later still)
+
+`v_dot2c_f32_f16` is accepted and exact on gfx1100 (checked with a two-element kernel: dot2((1,2),(3,4)) = 11), where
+the assembler rejects `v_dot2c_f32_bf16`. The hyper-connection read is the one place with a wide bf16 GEMV on the
+decode path, so `src/kernels/cuda/rdna_gr.cu` grew an fp16 pair behind `STRATA_GR_RDNA_F16=1`: the weights stay BF16
+in memory and are converted in registers once per (row, lane), the staged activations are written as fp16 pairs, and
+the row dot becomes 4 packed dots per 8 elements instead of 8 unpack+fma pairs.
+
+Measured (32K, production switches, stage table):
+
+| | hc0 down | hc0 up | hc1 down | hc1 up | total | ms_fwd | acceptance |
+|---|---|---|---|---|---|---|---|
+| default | 0.66 | 0.65 | 0.64 | 0.64 | 22.11 | 25.89 | 161/219 |
+| fp16 dot2 | 0.62 | 0.63 | 0.61 | 0.62 | 22.04 | 25.63 | 160/220 |
+
+**Not deployed**: ~1% for a rounding change. The lesson is the shape of the kernel, not the instruction: the dot is
+only about a third of it - the R'`*w_norm` staging, the sum-of-squares pass and the 6.5 MB read are the rest - so
+halving the dot halves a third. The earlier "2 instructions an element x token" model matched the time by coincidence
+and is wrong.
+
 ## 4. What we did not take, and why
 
 - **The fork's tree as a base.** 0.1.43 against 0.1.54 is ~170 commits of upstream work (conversation snapshots,

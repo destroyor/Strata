@@ -55,11 +55,11 @@ __device__ __forceinline__ float dot8(const uint4 w, const float4 x0, const floa
 }
 
 template <int T, int RW>
-__global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_GR_WPE, 16))) rdna_gr_down(RdnaGr m) {
+__device__ __forceinline__ void down_body(const RdnaGr& m, int rg, int slice) {
     __shared__ __align__(16) float xs[T][H];
     __shared__ float sq[WV][T];
     const int t = threadIdx.x, lane = t & 31, wv = t >> 5;
-    const int rg = blockIdx.x, slice = blockIdx.y, c = slice >> 1, h = slice & 1;   // slice = 2c + h
+    const int c = slice >> 1, h = slice & 1;   // slice = 2c + h
     uint4 wv4[RW][HQ];
     bool act[RW];
 #pragma unroll
@@ -140,6 +140,11 @@ __global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_
             if (act[r] && lane == 1 && two) m.part[((size_t) (k0 + 1) * 2 * HC + slice) * PR + row] = v1;
         }
     }
+}
+
+template <int T, int RW>
+__global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_GR_WPE, 16))) rdna_gr_down(RdnaGr m) {
+    down_body<T, RW>(m, (int) blockIdx.x, (int) blockIdx.y);
 }
 
 // STRATA_QFUSE: the consumer's q8_1 image of `mixed`, as fused_gr.cu's gr_q8_tail - the two blocks of a 32-column
@@ -256,10 +261,64 @@ __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
     up_body<T>(m, blockIdx.x);
 }
 
+// STRATA_GR_FUSED=1 (opt-in): down and up in ONE launch - every block runs its down slice, a sense-reversing grid
+// barrier (the down grid's 168 blocks are co-resident: two blocks a CU at 8 waves, 113 VGPRs), then the first UB blocks
+// run the up pass.  The same two bodies, the same arithmetic per element as the two launches; one graph node less per
+// read (96 fewer a window), which is worth ~6 us each on gfx1100.  The barrier words are module-static (zeroed at
+// load) and self-resetting (a generation counter), so no allocation happens inside a graph capture.
+__device__ unsigned g_gr_bar[2];
+__device__ __forceinline__ void grid_barrier(unsigned* bar, unsigned nblocks) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        volatile unsigned* gen = bar + 1;
+        const unsigned g = *gen;
+        __threadfence();
+        if (atomicAdd(bar, 1u) == nblocks - 1) {
+            atomicExch(bar, 0u);
+            __threadfence();
+            atomicAdd(bar + 1, 1u);
+        } else {
+            while (*gen == g) __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    __syncthreads();
+    __threadfence();   // every wave: the other blocks' partials and sums
+}
+template <int T>
+__global__ void __launch_bounds__(TH) __attribute__((amdgpu_waves_per_eu(STRATA_GR_WPE, 16))) rdna_gr_fused(RdnaGr m) {
+    constexpr int NBX = (PR + 2 * WV - 1) / (2 * WV);   // the down grid's x extent (row groups)
+    const int b = (int) blockIdx.x;
+    down_body<T, 2>(m, b % NBX, b / NBX);
+    grid_barrier(g_gr_bar, gridDim.x);
+    if (b < UB) up_body<T>(m, b);
+}
+
+
 template <int T>
 void launch(const RdnaGr& m, cudaStream_t st, unsigned long long* sb, int si) {
     static const int only = [] { const char* v = std::getenv("STRATA_GR_RDNA_ONLY"); return v ? std::atoi(v) : 0; }();   // bench
     static const int rw = [] { const char* v = std::getenv("STRATA_GR_RDNA_RW"); return v ? std::atoi(v) : 2; }();
+    // STRATA_GR_FUSED: one launch for both passes, only when every down block is co-resident (a grid barrier deadlocks
+    // otherwise) - the occupancy is asked of the driver, and the profiler's two stamps need the two-launch path.
+    static const bool g_fused = [] { const char* v = std::getenv("STRATA_GR_FUSED"); return v != nullptr && v[0] == '1'; }();
+    static const int g_fused_ok = [] {
+        if (!g_fused) return 0;
+        int nblk = 0, cus = 0;
+#if defined(__HIPCC__)
+        if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&nblk, (const void*) &rdna_gr_fused<T>, TH, 0) != hipSuccess) return 0;
+#else
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nblk, rdna_gr_fused<T>, TH, 0) != cudaSuccess) return 0;
+#endif
+        if (cudaDeviceGetAttribute(&cus, cudaDevAttrMultiProcessorCount, 0) != cudaSuccess) return 0;
+        const int need = ((PR + 2 * WV - 1) / (2 * WV)) * 2 * HC;
+        if (nblk * cus >= need) return 1;
+        std::fprintf(stderr, "strata gr: STRATA_GR_FUSED off (%d blocks x %d CU < %d co-resident)\n", nblk, cus, need);
+        return 0;
+    }();
+    if (g_fused_ok && only == 0 && sb == nullptr) {
+        rdna_gr_fused<T><<<((PR + 2 * WV - 1) / (2 * WV)) * 2 * HC, TH, 0, st>>>(m);
+        return;
+    }
     if (sb) gpu_stamp(sb, si, st);
     if (only != 2) {
         if (rw == 1) rdna_gr_down<T, 1><<<dim3((PR + WV - 1) / WV, 2 * HC), TH, 0, st>>>(m);

@@ -418,6 +418,35 @@ Where the headroom is, then: **iq2_s gate/up at ~300 GB/s** (the 36 GDN layers' 
 per block / more waves would halve its 33 us and give back ~0.7 ms/window (2.7%); the expert bookkeeping (1.5 ms);
 the draft's long-context attention (only by paying acceptance).
 
+### 2j. The PCIe share's four empty nodes (2026-10-31 evening) - the biggest single win of the day
+
+The stage table's `PCIe grp` (0.53 ms) and `waitB` (1.04 ms) were *pure overhead*: at `--pcie-frac 0` the pool never
+plans a PCIe group, yet every layer still issued its staging wait (`wait_flag_ge(m_flagB_)`), `fetch_blobs`,
+`rebase_ptrs` and the empty `grouped()` launch. Skipping the whole block (a `Verifier::set_pcie_share` from the
+`--pcie-frac` the caller already knows; a balance model keeps it) gives, at 32K with the production switches:
+
+| | ms_fwd (profiled) | stage total | acceptance |
+|---|---|---|---|
+| control | 27.28 | 23.47 | 73.5% |
+| share skipped | **25.89** | **22.11** | 73.5% |
+
+Unprofiled: **23.91 ms/window**; the 16-prompt harness (160K chars, 192 tokens, 16 prompts): median **112.55 tok/s**
+(min 84.2, max 128.9), 23.53 ms/window, 73.0% acceptance - against 102.9 / 105.65 / 106.5 / 107.25 for the runs
+before it. No arithmetic changes: no group was ever planned (the decode timing line reports `PCIe 0.00`).
+
+**What it teaches:** a node in this window's graph costs **6-11 us** (four nodes = 1.4 ms of a 25.4 ms window), so
+the node count matters more than the kernels' shapes. Two consequences measured today:
+
+- `STRATA_GR_RDNA_RW` (1 / 2 / 4 rows per down block, ported from the fork) changes nothing: 0.66 ms either way.
+  The hyper-connection read is **ALU-bound, not bandwidth-bound**: 6.55 MB per call at 2 instructions per
+  (element x token) = ~18 us, and `v_dot2c_f32_bf16` - the only packed-bf16 dot - **the gfx1100 assembler rejects**
+  (`instruction not supported on this GPU`), so bf16 stays 1 element an instruction (fp16/int8 would change the
+  rounding; `STRATA_HC_Q8` costs 7.6 acceptance points, §2h).
+- `STRATA_GR_FUSED=1` (down + up in one launch behind a grid barrier, the fork's shape) is **off on this card**: the
+  driver reports 3 blocks x 48 multiprocessors = 144 co-resident blocks against the 168 the down grid needs, so its
+  own guard declines rather than risking a deadlock. Making it fit means a 4-slice down grid (84 blocks) and a
+  32-column up body (80 blocks) - not done.
+
 ## 4. What we did not take, and why
 
 - **The fork's tree as a base.** 0.1.43 against 0.1.54 is ~170 commits of upstream work (conversation snapshots,

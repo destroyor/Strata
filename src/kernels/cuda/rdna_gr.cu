@@ -259,8 +259,13 @@ __global__ void __launch_bounds__(TH) rdna_gr_up(RdnaGr m) {
 template <int T>
 void launch(const RdnaGr& m, cudaStream_t st, unsigned long long* sb, int si) {
     static const int only = [] { const char* v = std::getenv("STRATA_GR_RDNA_ONLY"); return v ? std::atoi(v) : 0; }();   // bench
+    static const int rw = [] { const char* v = std::getenv("STRATA_GR_RDNA_RW"); return v ? std::atoi(v) : 2; }();
     if (sb) gpu_stamp(sb, si, st);
-    if (only != 2) rdna_gr_down<T, 2><<<dim3((PR + 2 * WV - 1) / (2 * WV), 2 * HC), TH, 0, st>>>(m);
+    if (only != 2) {
+        if (rw == 1) rdna_gr_down<T, 1><<<dim3((PR + WV - 1) / WV, 2 * HC), TH, 0, st>>>(m);
+        else if (rw == 4) rdna_gr_down<T, 4><<<dim3((PR + 4 * WV - 1) / (4 * WV), 2 * HC), TH, 0, st>>>(m);
+        else rdna_gr_down<T, 2><<<dim3((PR + 2 * WV - 1) / (2 * WV), 2 * HC), TH, 0, st>>>(m);
+    }
     if (sb) gpu_stamp(sb, si + 1, st);
     if (only != 1) rdna_gr_up<T><<<UB, TH, 0, st>>>(m);
 }

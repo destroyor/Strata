@@ -2305,6 +2305,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out, true);
             stamp(l, 20, grp);
+            // --pcie-frac 0 and no balance model: the plan never holds a PCIe group, so the whole share - its staging
+            // wait, the fetch/rebase kernels and the empty grouped launch (11 us a layer on gfx1100) - is skipped.
+            const bool pcie_share = sink_.pcie_share || m_bal_ != nullptr;
+            if (pcie_share) {
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
                 wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
@@ -2320,6 +2324,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
             grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, false);
             stamp(l, 22, grp);
+            }
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,

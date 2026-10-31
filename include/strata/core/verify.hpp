@@ -371,6 +371,9 @@ public:
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
+    /// --pcie-frac 0 and no balance model: the pool never plans a PCIe share, so the window skips the second grouped
+    /// launch instead of issuing it empty (11 us a layer on gfx1100).  Before the first run.
+    void set_pcie_share(bool on) { sink_.pcie_share = on; }
     /// Called before every window this verifier launches (run, the batch and pipelined launches): the device's
     /// residency table catches up with the host's (the adaptive tier's evictions while its copies are in flight).
     /// It gets this verifier's stream; false (with the message in `err`) fails the launch.

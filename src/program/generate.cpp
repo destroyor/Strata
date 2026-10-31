@@ -10216,6 +10216,7 @@ int main(int argc, char** argv) {
             if (st > 0) {
                 stage_ver(st).set_split(o.spec_split);
                 stage_ver(st).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                stage_ver(st).set_pcie_share(o.pcie_frac > 0.0 || o.pcie_frac_auto);
             }
         }
         if (pipe) {   // the odd windows' pool routing: the same as the even ones', with their plans
@@ -10224,6 +10225,7 @@ int main(int argc, char** argv) {
                 split_drive_b.plan[st] = stage_ver_p(st, 1).plan_sink();
                 stage_ver_p(st, 1).set_split(o.spec_split);
                 stage_ver_p(st, 1).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                stage_ver_p(st, 1).set_pcie_share(o.pcie_frac > 0.0 || o.pcie_frac_auto);
             }
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
@@ -10237,6 +10239,7 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        ver.set_pcie_share(o.pcie_frac > 0.0 || o.pcie_frac_auto);
         // --pipeline-windows 2: stage 0's GDN state before a speculative commit, restored when the guess was wrong.
         // Window W reads the state its snapshot must hold and no window writes it (only commits do), so it is copied
         // on a side stream while W runs, into the buffer of W's parity, and only W's speculative commit waits for it
@@ -17955,6 +17958,7 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        ver.set_pcie_share(o.pcie_frac > 0.0 || o.pcie_frac_auto);
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;

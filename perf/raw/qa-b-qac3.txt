@@ -1,0 +1,4 @@
+ready in 153s
+b-qac3 | : what is the capital of France?              | 'The capital of France is Paris.'
+b-qac3 | : which chemical element has the symbol Au    | 'The chemical element with the symbol Au is gold.'
+b-qac3 | hat is 17 * 23?                               | '391'

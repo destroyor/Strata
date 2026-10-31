@@ -36,6 +36,7 @@ tag (`qsa_window_invalidate`), and the rows refill as the sequence appends.
 | `STRATA_KV_WINDOW=0` | on | turns the window off (pure 3-bit, for A/B) |
 | `STRATA_KV_WINDOW_SINKS=N` | 4 | leading cells kept in fp16 |
 | `STRATA_KV_WINDOW_TAIL=N` | 1024 | newest cells kept in fp16 |
+| `STRATA_PA_OCT=1` | off | the prompt attention on the matrix cores, reading the 3-bit codes (below; needs `STRATA_HIP_WMMA` on gfx11) |
 
 The startup log names the window the session actually sized:
 
@@ -94,12 +95,98 @@ run); the throughput is 1-3% lower because a 3-bit K loses a point or two of dra
 The production config (oct3, `--kv-resident 65536`, `--prefill auto:32768`) measures 1880 tok/s prefill at 32K,
 1794 at 96K, 25.0 / 25.5 ms per forward.
 
+## The matrix-core prompt attention for 3-bit codes (`STRATA_PA_OCT=1`)
+
+Before this switch, oct3 prefilled at 2280 / 2304 tok/s (32K / 96K) against `--kv int8`'s 3506 / 3559 with the same 23
+switches (`docs/PERF.md`). The 1.5x was not tuning: on AMD `qsa_prompt_attn_batch` took only INT8 pools, oct3 keeps its
+codes in the q4 pointers (`src/core/layer.cpp`: `st.k_q4 = c.take<uint8_t>(rows * oct_row)`), and our own
+`if (pools.oct3) return false;` refused the call outright - so every oct3 prefill ran the decode kernel's chunk path
+(`attn_chunk_kernel<4>`: 64-cell chunks, FP32 FMA per element, one 3-bit unpack per value, no tensor cores).
+
+`STRATA_PA_OCT=1` opens that gate with an oct3 arm of the same kernel (`prompt_attn_wmma_kernel<SPLIT, OCT>`):
+
+- **The codebook in registers.** An arm's 16 values come from three 16-bit bit-planes - the block's 12 code bytes, low
+  halves for the first 16 values, high halves for the next. Four codes at a time are spread out of one nibble of each
+  plane by the `0x00204081` multiply, combined into a 4-byte code word and mapped through the 8-entry int8 codebook
+  with a single `v_perm_b32`; the values enter the MMA as the int8 path's fp16 fragment does.
+- **Two scales per wave.** oct3 carries one fp16 `d` per 32 values where int8 carries one per 64, so a wave (64 dims)
+  spans two: q.k keeps two accumulator sets and adds them scaled after the MMA, and p.v builds one A fragment per
+  32-dim half (`vs`/`vsb`). `d` is folded with the codebook's fixed 1/32, so everything after the MMA is the int8
+  path's arithmetic and the p.v staging rows keep their 80 bytes.
+- **The exact window is not read by the prompt path** - it never was. With `--kv-resident` the prompt attention runs
+  on the staged pool (`pools_of`, which carries no window) in both formats; the window serves decode only.
+
+Correctness: `qsa_prompt_attn_parity` now runs oct3 beside int8 / FP16 / Q4_0. Against the FP64 reference the new
+kernel's worst error is 1.1e-9 on an output scale of 2.2e-3; against the FP32 mode-4 chunk kernel it replaces,
+2.0e-9 (7.9e-7 of scale) - the same answer, another summation order. The decode itself is checked bit for bit
+against `load8_oct`'s formula over 4096 random blocks (V path and K path).
+
+4 reps each, production config, one session (`perf/raw/perf-paoct2.jsonl`, `perf/raw/perf-int8ref.jsonl`):
+
+| KV | 32K prefill | 96K prefill |
+|---|---|---|
+| oct3, no `STRATA_PA_OCT` (the 0.1.54 deployment) | 2298 | 2305 |
+| `--kv int8` | 3516 | 3557 |
+| **oct3 + `STRATA_PA_OCT=1`** | **3443** | **3513** |
+
+The deployed service (the unit, the production config, `perf/raw/perf-deployed-paoct.jsonl`, 4 reps): **3457 / 3455 /
+3444** at 32K and **3537 / 3504 / 3507 / 3505** at 96K - the forum's 3.5K, 51% over the oct3 gather path it replaces.
+96K needles on the same service: 3 of 3 at depths 10/50/90.
+
+The 3-bit format now prefills within 1-2% of int8, at 2.4x fewer bytes per cell. Kernel level (synthetic, 2,048
+queries over a 32K context): 8.59 ms per chunk against int8's 8.05 (+6.7%), 4.2x the FP32 path it replaces.
+`HIP_WMMA` alone never helped oct3 because the format gate rejected the call before this arm existed (`2090 / 1928`
+with it, `2243 / 1979` without, `perf/raw/perf-fa54-wmma.jsonl`).
+
+### Accuracy
+
+`STRATA_PA_OCT_CHECK=N` (debug) runs both kernels on the same N queries of a chunk and prints the largest difference;
+on this box and the production config, a 4,500-token prompt, the first two QSA layers:
+
+| arm | max \|matrix cores - chunk path\| / output scale |
+|---|---|
+| oct3, `STRATA_PA_FAST=1` | 3.5e-4 |
+| oct3, `STRATA_PA_FAST=0` (q and p as fp16 hi + lo) | 7e-7 - 9e-7 |
+| int8, `STRATA_PA_FAST=1` (the deployed int8 arm) | 2.4e-4 - 2.7e-4 |
+| int8, `STRATA_PA_FAST=0` | 1.0e-6 - 1.1e-6 |
+
+So the fast arm costs what the int8 arm's fast path already costs (a single fp16 image of q and p), and the split arm
+is the FP32-level answer. `tools/needle_bench.py` at 32K, depths 10/50/90 (3 samples each, this box): the chunk path
+3/3, `PA_OCT` with the split 3/3, `PA_OCT` with `PA_FAST=1` 3/3, `--kv int8` with `PA_FAST=1` 3/3 - but two runs of
+the fast arm on an earlier build of the kernel missed all three, so a 3-sample needle run is not a quality gate for a
+3.5e-4 change; a longer-sampled run is the open item.
+
+**The exact window in the prompt path.** A session without `--kv-resident` hands the prompt attention
+`qsa_attn_pools(st)`, which carries the window; the staged pools of the production config carry none. The matrix-core
+arm reads it when it is there:
+
+- **K** - the window row's fp16 values go straight in as the arm's B fragment (each lane holds one cell's 16 dims), with
+  the cell's scale 1 instead of the codebook's `d/32`;
+- **V** - the window's cells have their codes masked out (`vs`/`vsb` 0) and their exact values added in FP32 as the
+  chunk's weights settle (4 V reads + 8 weight reads + 32 FMAs per window cell per lane), skipped entirely by a
+  wave-wide vote when a chunk holds none;
+- the window's rows live in registers (`__shfl` over lane = cell), not in shared memory: a shared array is rewritten by
+  the next chunk's staging before the slower waves have finished their p.v.
+
+Measured (`qsa_prompt_attn_parity`, which now runs an `oct3+win` arm beside the others: 4 sinks + 1024 tail rows, hits
+mixed with misses inside a 16-cell tile): every arm passes, and the window arm's output is the FP32 chunk path's -
+which reads the same window - to 1.2e-6-1.6e-6 of scale at 32K, 2.1K and 1.5K contexts. Kernel level, 32K context,
+2,048 queries: 9.44 ms per chunk against 37.2 for the chunk path (3.9x); the window's fp32 additions cost ~10% over
+the 8.60 ms of the no-window arm. End to end, `--kv oct3` without `--kv-resident` (the configuration where the window
+is live): **32K 2,305 -> 3,429 tok/s, 96K 2,298 -> 3,087-3,480** (`perf/raw/perf-nonres-*.jsonl`), 3 of 3 32K needles,
+the same window quality the chunk path had.
+
+Two bugs the parity arms caught while this was built: the window row travelled through an argument of `fetch()` whose
+evaluation order against `row_of()` is unspecified (the row was read as "no hit"), and the shared `wrow[]` array was
+stale-racy (nondeterministic output between two runs of the same arm).
+
 ## What it does not do
 
-- **Gather path only.** There is no fused decode-attention mode for oct3 (`qsa_decode_attn.cu` falls back to the
-  chunk kernel with `KV_MODE == 4`), no prompt-attention mode (`qsa_prompt_attn_batch` returns false), and no
-  row-batched or slot-batched attention (those exit with a message if asked for oct3). `--kv oct3` with
-  `STRATA_BATCH_ATTN_ROWS` or a multi-slot server is refused, not silently misread.
+- **Gather path + the prompt attention above.** There is no fused decode-attention mode for oct3 (`qsa_decode_attn.cu`
+  falls back to the chunk kernel with `KV_MODE == 4`), and no row-batched or slot-batched attention (those exit with a
+  message if asked for oct3). `--kv oct3` with `STRATA_BATCH_ATTN_ROWS` or a multi-slot server is refused, not
+  silently misread. The prompt attention takes oct3 (and its exact window) only with `STRATA_PA_OCT=1`
+  (`qsa_prompt_attn_batch` otherwise returns false and the caller keeps the chunk path).
 - **The MTP drafter stays on plain INT8** (`mtp.cpp`), for the same reason it does under k8v4.
 - **Not a snapshot format.** A slot image never contains the window; restoring invalidates it.
 - **Experimental.** The format is not a default and upstream has not accepted it.

@@ -1,0 +1,4 @@
+ready in 36s
+b-qaq6k | : what is the capital of France?              | 'The capital of France is Paris.'
+b-qaq6k | : which chemical element has the symbol Au    | 'The chemical element with the symbol Au is gold.'
+b-qaq6k | hat is 17 * 23?                               | '391'

@@ -35,3 +35,64 @@ zK3	160000	91.85	30.26	63.1	cfg-k8v4.json
 zO1	160000	90.75	30.25	60.5	cfg-oct3.json	
 zO2	160000	90.45	30.32	61.7	cfg-oct3.json	
 zO3	160000	90.40	30.37	60.0	cfg-oct3.json	
+facc-base	160000	90.00	30.32	60.0	cfg-fork-accel.json	
+facc-base2	160000	90.65	30.42	60.8	cfg-fork-accel.json	
+facc-cum25	160000	92.15	30.64	61.8	cfg-fork-accel.json	STRATA_SPEC_CUM=0.25
+facc-cum40	160000	93.05	30.49	66.3	cfg-fork-accel.json	STRATA_SPEC_CUM=0.4
+facc-cum40b	160000	93.55	30.36	66.3	cfg-fork-accel.json	STRATA_SPEC_CUM=0.4
+facc-cum60	160000	90.00	28.01	72.8	cfg-fork-accel.json	STRATA_SPEC_CUM=0.6
+facc-knobs	160000	82.10	33.17	63.4	cfg-fork-accel.json	the 13 switches of docs/FORK-RDNA3-MAPPING.md §1
+prod-deployed	160000	95.60	29.52	67.3	strata-sc117-iq3_s.json	the deployed unit: 22 switches + STRATA_SPEC_CUM=0.4
+fmt-int8-t1	160000	90.75	33.27	64.9	cfg-int8-pf32k.json	the deployed 23 switches
+spec3	160000	92.05	24.55	75.1	ab/cfg-spec3.json	SPEC_CUM=0.4
+spec8	160000	89.00	35.36	58.0	ab/cfg-spec8.json	SPEC_CUM=0.4
+spec5cum50	160000	93.95	29.04	70.4	strata-sc117-iq3_s.json	SPEC_CUM=0.5
+spec6	160000	88.70	38.67	61.9	ab/cfg-spec6.json	SPEC_CUM=0.4
+spec4	160000	95.50	27.41	70.7	ab/cfg-spec4.json	SPEC_CUM=0.4
+spec4cum50	160000	95.30	26.98	74.2	ab/cfg-spec4.json	SPEC_CUM=0.5
+bfuse-wf0	160000	94.90	27.41	71.3	strata-sc117-iq3_s.json	prod (23 switches)
+bfuse-wf1	160000	96.75	27.23	72.9	strata-sc117-iq3_s.json	prod + FUSE_WAIT=1 (0.1.49.2 binary)
+bfuse-c0	160000	96.05	26.97	73.0	strata-sc117-iq3_s.json	prod (40a61eaa)
+bfuse-c0c	160000	98.20	27.04	74.2	strata-sc117-iq3_s.json	prod (40a61eaa)
+bfuse-c1	160000	97.55	27.20	72.9	strata-sc117-iq3_s.json	prod + ROUTE_PUBLISH=1
+bfuse-c2	160000	97.85	27.10	72.9	strata-sc117-iq3_s.json	prod + COMBINE_CPU=1
+bfuse-c3	160000	97.50	27.10	72.5	strata-sc117-iq3_s.json	prod + COMBINE_CPU=1 FUSE_WAIT=1
+bfuse-c3b	160000	96.50	26.67	69.8	strata-sc117-iq3_s.json	prod + COMBINE_CPU=1 FUSE_WAIT=1
+bfuse-c3c	160000	97.30	26.90	72.0	strata-sc117-iq3_s.json	prod + COMBINE_CPU=1 FUSE_WAIT=1
+q6k-off	160000	95.70	27.28	70.7	strata-sc117-iq3_s.json	prod
+q6k-off-b	160000	94.25	27.76	71.2	strata-sc117-iq3_s.json	prod
+q6k-on	160000	97.40	26.54	71.8	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1
+q6k-on-b	160000	99.15	26.22	71.4	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1
+q6k-nw1	160000	98.50	26.67	74.3	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1 MMVQ_SMALLK_NW=1
+q6k-nw2	160000	98.10	26.72	72.0	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1 MMVQ_SMALLK_NW=2
+q6k-packed	160000	100.45	27.30	72.1	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1 Q6_PACKED=1
+q6k-packed-b	160000	96.65	26.62	68.7	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1 Q6_PACKED=1
+q6k-packed-c	160000	98.85	26.76	73.2	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1 Q6_PACKED=1
+q6k-ctl2	160000	96.30	27.56	69.5	strata-sc117-iq3_s.json	prod + RDNA_Q6K=1
+gnpp1	160000	95.40	27.16	70.1	strata-sc117-iq3_s.json	prod + GDN_PP=1
+sh0q6	160000	95.65	27.42	71.8	strata-sc117-iq3_s.json	prod + SH_STREAM=0 GPU_MAX_HW_QUEUES=6
+pw4	160000	91.85	27.92	72.2	ab/cfg-w4.json	prod, pool-workers 4
+pw8	160000	94.80	27.71	72.5	ab/cfg-w8.json	prod, pool-workers 8
+cost6	160000	94.55	29.59	66.6	ab/cfg-spec6b.json	prod + SPEC_COST=1
+minp0	160000	92.25	28.93	56.5	ab/cfg-minp0.json	prod + RDNA_Q6K, spec-min-p 0
+minp20	160000	98.60	27.04	71.7	ab/cfg-minp20.json	prod + RDNA_Q6K, spec-min-p 0.2
+minp25	160000	99.30	27.18	70.3	ab/cfg-minp25.json	prod + RDNA_Q6K, spec-min-p 0.25
+minp25b	160000	101.05	26.69	71.6	ab/cfg-minp25.json	prod + RDNA_Q6K, spec-min-p 0.25
+minp25c	160000	98.60	27.34	71.6	ab/cfg-minp25.json	prod + RDNA_Q6K, spec-min-p 0.25
+minp25c5	160000	96.75	26.51	74.1	ab/cfg-minp25.json	prod + RDNA_Q6K, spec-min-p 0.25 CUM=0.5
+minp30	160000	98.90	26.76	68.0	ab/cfg-minp30.json	prod + RDNA_Q6K, spec-min-p 0.3
+nosfx	160000	94.75	26.76	72.4	ab/cfg-nosfx.json	prod + RDNA_Q6K, suffix-draft 0
+rtl-fuse	160000	102.50	26.53	74.7	strata-sc117-iq3_s.json	prod + RDNA_Q6K + COMBINE_CPU FUSE_WAIT ROUTE_PUBLISH
+rtl-ctl	160000	96.85	26.42	70.8	strata-sc117-iq3_s.json	prod + RDNA_Q6K
+ref-fuse-off	32768	92.60	28.50	69.1	fork 0.1.43	no COMBINE_CPU/WAIT_FUSE/ROUTE_PUBLISH
+ref-noenv	32768	94.50	27.64	71.2	fork 0.1.43	no env
+u143-upstream	32768	92.50	27.95	68.9	upstream v0.1.43	7 switches
+grctl2-20261031	160000	91.65	28.65	70.9	strata-sc117-iq3_s.json	prod + RDNA_Q6K, VERIFY_PROFILE=1 (its cost ~5%), GR_RDNA off
+grrdna-20261031	160000	107.25	25.68	73.8	strata-sc117-iq3_s.json	prod + RDNA_Q6K + GR_RDNA
+p2med-20261031	160000	105.65	25.20	71.9	strata-sc117-iq3_s.json	prod + RDNA_Q6K + GR_RDNA + PLE direct (deployed)
+c3med-20261031	160000	100.25	24.43	66.0	strata-sc117-iq3_s.json	+ mtp-window 4096: 1 ms cheaper, 6 acceptance points gone
+c60-20261031	160000	100.85	24.25	75.6	strata-sc117-iq3_s.json	+ SPEC_CUM 0.6: fewer tokens per window, net loss
+deployed-med-20261031	160000	103.30	24.46	70.8	(deployed unit, port 8089)	prod + RDNA_Q6K + GR_RDNA + PLE direct, measured through the service
+hcq8med-20261031	160000	101.75	24.53	68.0	strata-sc117-iq3_s.json	prod + RDNA_Q6K + HC_Q8 (int8 hc): 0.7 ms cheaper, 4 acceptance points gone
+deployed-fuse-20261031	160000	102.90	25.32	70.8	(deployed unit)	prod + GR_RDNA + PLE direct + COMBINE_CPU/WAIT_FUSE/ROUTE_PUBLISH
+deployed-fuse2-20261031	160000	106.50	25.37	71.5	(deployed unit)	same config, repeat

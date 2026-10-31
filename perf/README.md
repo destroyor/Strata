@@ -21,11 +21,12 @@ not in this repo (they name this box's model paths); they were kept in `/tmp` on
 | `cfg-oct3-r64k.json` | oct3 | 65536 | `auto:8192` |
 | `cfg-pf32k.json` | oct3 | 65536 | `auto:32768` |
 | `cfg-forkA.json` | oct3 | 65536 | `auto:32768` (plus the environment in `docs/FORK-RDNA3-MAPPING.md` §1) |
+| `cfg-fork-accel.json` | oct3 | 65536 | `auto:32768`, and `exe` = the fork's `build-hip-oct3/strata` (the `facc-*` arms) |
 | production | oct3 | 65536 | `auto:32768` |
 
 Label prefixes in `raw/`: `p`/`z`/`f` = the plain oct3/k8v4 pair, `g64`/`h96`/`p64`/`y24` = context-length arms,
 `s24` = window-tail arms, `v` = window V-side arms, `pf32`/`pf8` = prefill-chunk arms, `fork*` = the upstream-switch
-arm.
+arm, `facc-*` = the `STRATA_SPEC_CUM` arms (base / cum25 / cum40 / cum40b / cum60).
 
 ## Harness
 

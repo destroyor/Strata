@@ -70,14 +70,41 @@ User unit `strata-sc117` (owner `des`), OpenAI-compatible server on **8089**:
 WorkingDirectory=/home/des/test/strata
 ExecStart=/home/des/test/strata/.venv/bin/python -m serve.server \
           --engine strata --config strata-sc117-iq3_s.json --port 8089
-Restart=on-failure
+Restart=no
 RestartSec=15
+LimitCORE=0
+LimitMEMLOCK=infinity
 Environment=LD_LIBRARY_PATH=/opt/rocm/lib
 Environment=STRATA_ADAPT_OVERLAP=1
 Environment=STRATA_PREFILL_MMQ=1
 Environment=STRATA_HIPBLASLT_TUNING=/home/des/test/strata/tools/hip/gfx1100-hipblaslt-100500-20261016.txt
-Environment=STRATA_PREFILL_RING=96
 Environment=STRATA_IO_THREADS=32
+# upstream's gfx1151/gfx12 switches, measured on this gfx1100 (docs/FORK-RDNA3-MAPPING.md §1)
+Environment=STRATA_PREFILL_RING=192
+Environment=STRATA_PREFILL_CPU_SHARE=auto
+Environment=STRATA_PREFILL_CPU_SHARE_MAX=6144
+Environment=STRATA_QFUSE=1
+Environment=STRATA_PA_FAST=1
+Environment=STRATA_HC_UPMIX=1
+Environment=STRATA_HEAD_MIX_MULTI=1
+Environment=STRATA_VERIFY_QDEDUP=1
+Environment=STRATA_KV_HOST_DMA=1
+Environment=STRATA_PF_FUSED=1
+Environment=STRATA_PF_GEMM=1
+Environment=STRATA_PF_PAD=1
+Environment=STRATA_PF_HCDOWN=1
+Environment=STRATA_HIP_WMMA=1
+Environment=STRATA_SELECT_WMMA=1
+Environment=STRATA_GDN_CHUNKED=1
+Environment=STRATA_GDN_HEAD=1
+Environment=STRATA_GDN_CONVL2=1
+Environment=STRATA_GDN_NOY=1
+Environment=STRATA_GDN_PP=2
+Environment=STRATA_PF_F16=2
+Environment=STRATA_PREFILL_AUTO_MAX=32768
+Environment=STRATA_STAGER_RING=64
+# this repo's MTP window floor (docs/FORK-RDNA3-MAPPING.md §2a)
+Environment=STRATA_SPEC_CUM=0.4
 ```
 
 The engine arguments (`strata-sc117-iq3_s.json` → `args`), the ones that matter here:
@@ -104,6 +131,11 @@ Memory at load (engine 0.1.49.2): experts 46.84 GiB pinned in RAM, expert cache 
 KV streaming 65,536 of 262,144 cells per QSA layer plus 2.39 GiB of pinned K/V, the oct3 window 24.1 MiB over 12
 layers. `710 MiB of VRAM free with everything loaded` on the v0.2.8 build; the verify graph's capture then takes
 ~550 MiB of that. **Plan capacity with the post-capture number, not the load-time one.**
+
+Optional and measured, not enabled by default: [`perf/presets/gfx1100-prefill.env`](../perf/presets/gfx1100-prefill.env)
+- upstream's gfx1151/gfx12 switches, +13% prefill at 32K on this box, at a prompt-path KL of 0.0138 against the
+unswitched run (`docs/FORK-RDNA3-MAPPING.md` §1 has the numbers and the one unreproduced hang). Add its lines to the
+unit's `Environment=` only if that trade is wanted.
 
 ## 4. Start, stop, verify
 
@@ -148,13 +180,14 @@ what the A/Bs used.
 
 | what | how |
 |---|---|
-| back to the upstream engine | the service unit's `engine/strata` is untouched by this fork; stop the unit, `install build-hip-oct3/strata engine/strata` only if you meant to replace it |
+| back to the 0.1.49.2 engine (the state before 2026-10-30) | `systemctl --user stop strata-sc117`, copy `strata` and `BUILD.json` from `/root/strata-bak-pre0154-20261030-115709/`, start, wait for `/health` 200 |
 | back to k8v4 | edit `--kv oct3` → `--kv k8v4` in `strata-sc117-iq3_s.json`, restart |
 | window off, same format | `Environment=STRATA_KV_WINDOW=0` in the unit, restart |
-| the whole engine tree | `/root/strata-bak-pre0242-20261025-171737/` (0.1.47), `/root/strata-bak-rows1-20261027-190924/` (0.1.49.2 before the rows1 work), and the oct3-era trees `/root/strata-bak-window-20261030-000411/`, `/root/strata-bak-window2-0247/` |
+| the switch set off | drop the 22 lines under the `fork-accel` comments in the unit (the pre-2026-10-30 unit is in the same backup directory), `daemon-reload`, restart |
+| the whole engine tree | `/root/strata-bak-pre0154-20261030-115709/` (0.1.49.2, 40 MB, with `tree.diff`), `/root/strata-bak-pre0242-20261025-171737/` (0.1.47), `/root/strata-bak-pre022-20261022-113330/`, and the oct3-era trees `/root/strata-bak-window-20261030-000411/`, `/root/strata-bak-window2-0247/` |
 
 A rollback that leaves `engine/BUILD.json`'s `version`/`src` fields behind makes later diagnostics wrong; update them
-with the binary.
+with the binary (the deployed one says `0.1.54` / `90ba622d-0280+oct3+spec-cum+rows1`).
 
 ## 7. Pitfalls seen on this box
 

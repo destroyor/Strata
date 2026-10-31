@@ -432,7 +432,9 @@ plans a PCIe group, yet every layer still issued its staging wait (`wait_flag_ge
 
 Unprofiled: **23.91 ms/window**; the 16-prompt harness (160K chars, 192 tokens, 16 prompts): median **112.55 tok/s**
 (min 84.2, max 128.9), 23.53 ms/window, 73.0% acceptance - against 102.9 / 105.65 / 106.5 / 107.25 for the runs
-before it. No arithmetic changes: no group was ever planned (the decode timing line reports `PCIe 0.00`).
+before it. No arithmetic changes: no group was ever planned (the decode timing line reports `PCIe 0.00`). Quality on the deployed
+binary with the production switches: 96K needle at 50% depth **FOUND** (94,805 prompt tokens), and the 32K arm accepts
+the same 161 of 219 drafts as the control.
 
 **What it teaches:** a node in this window's graph costs **6-11 us** (four nodes = 1.4 ms of a 25.4 ms window), so
 the node count matters more than the kernels' shapes. Two consequences measured today:

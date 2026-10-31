@@ -376,6 +376,48 @@ move the number. Still to do: the int8 `GR_RDNA` read (blocked on the quality lo
 (`STRATA_RDNA_MMVQ_WAVE`), the CPU IQ3_S byte-plane kernel (mostly idle cores here: 4 pool workers cost only 4%), and
 `PA_KLDS` / `PREFILL_MMQ_TILE_ROWS` (prefill).
 
+### 2i. Kernel-level: rocprof is blind here, the benches are not (2026-10-31)
+
+**rocprofv3 cannot see this engine's dispatches.** `rocprofv3 --attach <engine pid>` fails
+(`rocattach_attach_tree failed ... error code 1`); launched as the parent it records only the runtime's own
+`__amd_rocclr_copyBuffer` (204 calls) and `__amd_rocclr_fillBufferUnAligned` (96 calls) for a 30K prefill plus a
+32-token decode, no compute kernel at all (the stats and the 41 KB kernel trace agree); `ROCPROF_KERNEL_TRACE` in the
+engine's own environment behaves the same. The engine links the same `/opt/rocm/lib/libamdhip64.so.7` the profiler
+interposes, so this is its dispatch path (graphs / its own queue), not the build. The engine's own stage stamps
+(§2g) remain the per-stage measurement; the per-kernel numbers below come from the tree's benches, which run the
+same kernels on the same weights.
+
+`native_expert_bench <shard1.gguf> <layer> 10 <T> 0 0 100` - the routed-expert GEMV of one layer, 10 experts,
+GPU-side, with the production kernel (mode 0):
+
+| layer (gate/up, down) | T=1 | T=2 | T=3 | T=4 | T=6 | T=8 |
+|---|---|---|---|---|---|---|
+| **20** iq3_xxs / q2_0, all | 40 us | 44 | 47-53 | 56-59 | 91 | 100 |
+| gu | 23-24 us (518-540 GB/s) | 26-28 (452-488) | 31 (407-410) | 32-34 (371-391) | 49-54 (233-258) | 56-58 (216-223) |
+| down | 13-14 us (327-348 GB/s) | 15-16 (283-302) | 17-19 (248-272) | 19-21 (219-245) | 31-32 (144-147) | 36-37 (126-128) |
+| **3 / 11 / 24** iq2_s / iq4_nl, all (T=3) | | | 47-54 | | | |
+| gu (T=3) | | | 33-35 us (**295-315 GB/s**) | | | |
+| down (T=3) | | | 17-18 us (501-540 GB/s) | | | |
+| **47** iq4_xs / iq4_nl, all (T=3) | | | 45-50 | | | |
+| gu (T=3) | | | 30 us (582-590 GB/s) | | | |
+
+Mode 1 is the reference (not timed), mode 2 is the scalar path (2x slower: 112 us), mode 3 the older grouped layout
+(50.6 us, a wash) - **mode 0, what production runs, is already the fastest of the three**.
+
+At the deployed window (T ~2.5) that is ~48 us per layer; x 48 layers = **2.3 ms/window of pure expert GEMV**, against
+the stage table's 3.15 + 1.04 ms "VRAM hits" - i.e. ~1.5 ms/window of per-layer bookkeeping (plan, cache, combine,
+launches) rides on top of the GEMVs. The dense side (`q8_gemv_bench`, GDN qkv 2560x10240, 27.85 MB): 80.9 us at one
+column (344 GB/s), 49.3 us at two (565 GB/s).
+
+The draft's 3.0 ms/window splits (no profiler, so by construction and by the arms we have): the draft head is 106299
+rows (213 MiB) read once per draft forward - ~0.35 ms at 600 GB/s; the draft's own MoE is one layer's GEMV (~50 us);
+the rest is its attention over the whole 30K oct3 KV, which is exactly what `--mtp-window 4096` removes (-1.1 ms, at
+0-4 acceptance points, §2h).
+
+Where the headroom is, then: **iq2_s gate/up at ~300 GB/s** (the 36 GDN layers' experts) - a layout with more rows
+per block / more waves would halve its 33 us and give back ~0.7 ms/window (2.7%); the expert bookkeeping (1.5 ms);
+the draft's long-context attention (only by paying acceptance).
+
 ## 4. What we did not take, and why
 
 - **The fork's tree as a base.** 0.1.43 against 0.1.54 is ~170 commits of upstream work (conversation snapshots,

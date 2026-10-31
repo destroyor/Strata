@@ -611,6 +611,18 @@ memory-bound), the QSA group 2.64, the dense qkv/q/q-idx 2.09, the shared expert
 + 0.03 + 0.03 = 0.43, ~6 us a layer for 61 KB of rows - pure launch cost). None is above 3.9 ms; the draft's 3.10 ms
 is a separate graph (§2k).
 
+**The launch-sized items do not pay either, and one arm is not a measurement.** The same session, paired arms (control
+/ arm, control / arm, same config otherwise - the arm-to-arm spread here is +-0.15 ms, which is what made the first
+single-arm result below look like a win):
+
+| arm | ms_fwd (paired) | verdict |
+|---|---|---|
+| `STRATA_GR_NORM_FAST=1` (the register-staged split norm; gfx12's default, `gr_norm_split_kernel`'s twin) | 24.66 -> 24.80, 24.75 -> 24.84 | **0.1 ms worse**, twice: not the 6 us/launch of a launch-shaped stage |
+| `STRATA_VERIFY_HYBRID_PLAN=1` (this section's own work) | 25.02 -> 25.11 | neutral |
+
+So the hyper-connection norm passes are not launch-bound in the way the 2.7 us-a-node exchange rate suggests: their
+6 us a launch is the read and the reduction, and the staging that replaces it is no cheaper on gfx11.
+
 ## 4. What we did not take, and why
 
 - **The fork's tree as a base.** 0.1.43 against 0.1.54 is ~170 commits of upstream work (conversation snapshots,

@@ -522,7 +522,9 @@ and is wrong.
 ### 2m. The plan wait: why a hybrid device plan is now a code change and not a knob (2026-10-31, last)
 
 The window's per-layer host round trip (`waitA` 0.44 ms profiled: publish the ids, the pool plans, the GPU copies the
-plan) is the largest item left. The E-6 device-plan path exists (`STRATA_VERIFY_DEVICE_PLAN=1`,
+plan) looked like the largest item left. **It is not** - built and measured in §2n: the wait is 0.58 ms of the profiled
+22.2 and removing it entirely changes the window by nothing, because the GPU's ring-to-ring time is its own compute.
+The E-6 device-plan path exists (`STRATA_VERIFY_DEVICE_PLAN=1`,
 `resident_plan_kernel`/`resident_plan_par_kernel`, `skip_`), but it is all-or-nothing: one non-resident expert sets
 `s_bad` and the kernel writes `skip = 0`, so with a 36% expert cache every layer falls back to the host plan. At ~21
 distinct experts a layer and a 93% hit rate, P(all hit) is ~0.2, so the feature is worth little today.
@@ -550,6 +552,64 @@ Six more switches closed on the 32K arm (control 24.45-24.83 ms, 110.2 tok/s, 16
 | `STRATA_ATTN_MERGE_V2=1` (bitwise batched merge) | 24.43 | neutral |
 | `STRATA_HIP_SWIGLU_FUSED=1` | 24.80 | neutral |
 | `STRATA_ATTN_V3=1` | 24.73 | neutral |
+
+### 2n. The hybrid device plan, built and measured: exact, and neutral (2026-10-31, last)
+
+§2m's two blockers are now code. `resident_plan_kernel<NT, PARTIAL>` leaves a non-resident entry out of the plan
+instead of failing it (its `dst`/`tok` slot is not written, the group scans and `counts[1]` count the hit entries
+only, `start[groups] = hits`), and `verify.cpp` with `STRATA_VERIFY_HYBRID_PLAN=1` (which implies
+`STRATA_VERIFY_DEVICE_PLAN=1`) drops the host plan entirely - no `wait_flag_ge_or`, no plan copy - and takes the CPU's
+rows through `copy_rows_from_mapped[_after]` (the plan's hit list is the mask, `+0.0` for a hit) or, with
+`STRATA_COMBINE_CPU=1`, lets `combine_cpu_k10_vec4` mask them itself (`cfuse_on` now accepts a hybrid device plan; the
+all-or-nothing device plan still refuses it). No PCIe share: with `--pcie-frac 0` there is none, and the flag is
+refused when there is.
+
+Correctness first: `resident_plan_parity` grew a partial mode (16 cases over n = 10..80, a third of the experts
+evicted, with and without `slot_off`; every other word of the plan compared against the host replay of the resident
+entries, the left-out slots checked untouched) - **657 cases, 0 failures**. Then the 32K arm, production env plus the
+three decode fusions (the control reproduces 24.88 ms / 161 of 219):
+
+| arm | ms_fwd | tok/s | accepted |
+|---|---|---|---|
+| control | 24.88 | 108.3 | 161/219 |
+| `STRATA_ADAPT_OVERLAP=0` (needed: the tier's lag is why E-6 refuses the gate) | 25.02 | 107.7 | 161/219 |
+| + `VERIFY_DEVICE_PLAN=1 VERIFY_HYBRID_PLAN=1` | 25.11 | 107.3 | 161/219 |
+
+**Neutral** (the 0.09 ms is inside the arm's +-0.2 ms spread), and the tokens are identical - a fifth run of the same
+prompt with the same 161 acceptances. The profiled stage table says why:
+
+| stage | control | hybrid |
+|---|---|---|
+| `waitA` (GDN / QSA) | 0.44 / 0.14 | **0.08 / 0.03** |
+| `router+plan+bell` (GDN / QSA) | 1.01 / 0.35 | 1.24 / 0.42 |
+| total | 22.21 | 21.82 |
+
+The wait really is gone (0.58 -> 0.11 ms), and the plan/publish stage absorbs it: the GPU's ring-to-ring time is its
+own compute, so a wait it no longer takes is time it spends idle somewhere else in the same chain. That is confirmed
+by the production decode timing (`STRATA_DECODE_TIMING=1`, warm window):
+
+```
+24.33 ms/window = verify 21.17 (GPU-reach wait 17.38 + per-layer host 2.83 [plan 0.06 actq 0.07 CPU 2.65]
+                  + stage 0.02) + draft 3.10 + the rest 0.06;
+                  per layer-window: CPU experts 2.02 (2.25 entries), VRAM hits 30.33
+```
+
+and by the first (cold-cache) window of the same request: +1.82 CPU experts a layer made the host's serve 2.37 ms
+dearer and the window only 0.7 ms dearer - **~70% of the CPU's work is already hidden behind the GPU**, and the
+remaining third is the only part a faster pool can return.
+
+So the window is GPU-shape-bound: 18 of its 21.2 ms are the card's own work and every stage in the table is 0.1-3.9
+ms of it. `STRATA_ADAPT_OVERLAP` is worth 0.14 ms (0.6%) here - it is not what the hybrid costs. The plan wait stays
+opt-in and off: with the host round trip hidden, there is nothing for it to win, and §2m's 8-12 us a layer was the
+*stall* number, not the window's.
+
+What that leaves, in order of measured size (ms a window, profiled total 22.2): the hyper-connection read 3.88 (410
+GB/s of 6.5 MB a launch, 244 launches), the expert GEMVs 4.21 (`native_expert_bench`: IQ3_XXS gate/up 518-540 GB/s,
+IQ2_S 295-315 - the 2-bit layout does the same dp4a work on 2/3 the bytes, so its GB/s number is arithmetic-bound, not
+memory-bound), the QSA group 2.64, the dense qkv/q/q-idx 2.09, the shared expert 1.60, out-proj 1.38, router+plan+bell
+1.36, the GDN recurrence 2.08, the head 0.75, and the 6 launch-shaped hyper-connection slots' norm passes (0.29 + 0.08
++ 0.03 + 0.03 = 0.43, ~6 us a layer for 61 KB of rows - pure launch cost). None is above 3.9 ms; the draft's 3.10 ms
+is a separate graph (§2k).
 
 ## 4. What we did not take, and why
 

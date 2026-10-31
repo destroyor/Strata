@@ -534,6 +534,7 @@ private:
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (all-resident graph)
     const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
+    bool hybrid_plan_ = false;            ///< STRATA_VERIFY_HYBRID_PLAN: that plan holds the resident experts only
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
     unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device

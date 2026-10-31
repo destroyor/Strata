@@ -1176,6 +1176,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
         // (not with set_always_publish: the device table may lag the host's while windows are in flight)
         device_plan_ = !all_resident_ && !always_publish_ && (v != nullptr && std::atoi(v) != 0);
+        // STRATA_VERIFY_HYBRID_PLAN: the plan holds this group's resident experts only, its non-resident entries are
+        // the CPU's rows (which the combine masks by the plan's hit list) - the group no longer needs the host's plan.
+        const char* h = std::getenv("STRATA_VERIFY_HYBRID_PLAN");
+        hybrid_plan_ = device_plan_ && h != nullptr && std::atoi(h) != 0;
     }
     // (halo's STRATA_VERIFY_RESIDENT=1 is this window's all_resident_ graph above, which 0.1.39 has on by default)
     if (g_qfuse() || g_qfuse_hc()) {   // S26: the HC read's q8_1 group counters, zeroed once (each launch leaves them zero)
@@ -1232,6 +1236,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
+    // STRATA_VERIFY_HYBRID_PLAN: the group's device plan holds its resident experts only (its misses are the CPU's rows,
+    // which the combine masks by the plan's hit list), so the window never waits for the host's plan.  Not with a PCIe
+    // share: the device cannot plan the groups the host took off the GPU.
+    const bool hplan = hybrid_plan_ && !sink_.pcie_share && m_bal_ == nullptr;
+    if (hybrid_plan_ && !hplan) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr, "strata verify: STRATA_VERIFY_HYBRID_PLAN is off with a PCIe expert share\n");
+        }
+    }
     // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
     const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
@@ -1262,7 +1277,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // hit_out (no copy_rows_from_mapped / moe_hit_add launches), bitwise the launches it replaces
     static const bool g_cfuse = env_on("STRATA_COMBINE_CPU");
     auto cfuse_on = [&](int n) {
-        return g_cfuse && !ar_on() && !device_plan_ && !remote_opt_ && K == 10 && native_moe_combine_enabled() &&
+        return g_cfuse && !ar_on() && (!device_plan_ || hplan) && !remote_opt_ && K == 10 && native_moe_combine_enabled() &&
                dec_batch && n > 1 && n <= 8 && shared_expert_native_bf16_enabled() &&
                strata::kernels::cpu::expert_layout().native && (N & 3) == 0;
     };
@@ -2153,7 +2168,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                               hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                               plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
-                              (uint32_t) ((l - lb_) * G + grp + 1), cs);
+                              (uint32_t) ((l - lb_) * G + grp + 1), cs, nullptr, hplan ? 1 : 0);
 #if defined(STRATA_USE_HIP)
             if (g_doorbell_store)   // #649 A/B: the step's ring stored, not incremented over PCIe
                 doorbell_publish_value(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
@@ -2288,10 +2303,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             grouped(p_ptr, p_start, p_counts, 0, parts_out, true);
             stamp(l, 20, grp);
         } else {
-            if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
+            if (device_plan_ && !hplan) {   // E-6: skipped when the device planned this group (all its experts resident)
                 wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
                 copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
-            } else {
+            } else if (!device_plan_) {   // (hplan: the device's plan is this group's plan - nothing comes from the host)
                 if (fuse_wait_on() && !prof_on_ && m_bal_ == nullptr) {   // 143-amdk: one launch for the wait and the copy
                     wait_copy_i32_from_mapped(m_flagA_, ring, pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
                 } else {
@@ -2325,10 +2340,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, false);
             stamp(l, 22, grp);
             }
-            if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
-                wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
-                copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
-                                         skip_ + grp, ring, cs);
+            if (device_plan_ && !cfuse_on(n)) {   // no host plan: the group's misses are zeros, or (hplan) the CPU's rows
+                if (!hplan) {
+                    wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
+                    copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
+                                             skip_ + grp, ring, cs);
+                } else if (fuse_rows_on() && !prof_on_ && !remote_opt_) {   // the wait folded into the copy's blocks
+                    copy_rows_from_mapped_after(m_flag_, ring, parts_out, m_ymiss_ + (size_t) tb * K * N,
+                                                (int64_t) n * K, N, p_dst, p_counts + 1, cs);
+                } else {
+                    wait_flag_ge(m_flag_, ring, cs);   // the CPU's share is in the mapped rows
+                    copy_rows_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
+                                          p_dst, p_counts + 1, cs);
+                }
             } else if (cfuse_on(n)) {
                 // the CPU's share is in the mapped rows: the combine reads them (STRATA_FUSE_WAIT: waits in it)
                 if (!fuse_wait_on()) wait_flag_ge(m_flag_, ring, cs);

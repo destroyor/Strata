@@ -619,9 +619,20 @@ single-arm result below look like a win):
 |---|---|---|
 | `STRATA_GR_NORM_FAST=1` (the register-staged split norm; gfx12's default, `gr_norm_split_kernel`'s twin) | 24.66 -> 24.80, 24.75 -> 24.84 | **0.1 ms worse**, twice: not the 6 us/launch of a launch-shaped stage |
 | `STRATA_VERIFY_HYBRID_PLAN=1` (this section's own work) | 25.02 -> 25.11 | neutral |
+| `STRATA_EXP_TRIM=<rows>` (the expert group grid's y extent cut to that many block rows - every kernel `launch_gu`/`launch_down` pick strides over the groups, so a window's ~21 groups of the n*K = 60 rows it is sized for leave 2/3 of the grid as blocks that dispatch, read `*n_groups` and exit) | 24.90 -> 24.58, 24.58 -> 24.83, 24.78 -> 24.39, 24.64 -> 24.72 (24 rows) | **neutral**: mean -0.10 ms over four pairs, spread +-0.4. The empty rows are cheaper than a 2.5 ns dispatch each - reverted, not deployed |
 
 So the hyper-connection norm passes are not launch-bound in the way the 2.7 us-a-node exchange rate suggests: their
 6 us a launch is the read and the reduction, and the staging that replaces it is no cheaper on gfx11.
+
+**What that means for the next step.** The 32K arm's arm-to-arm spread is +-0.15 ms and a *paired* difference still
+scatters +-0.4, so anything under ~0.5 ms (2%) cannot be settled by this protocol at all - four more paired arms of a
+0.1-0.3 ms idea read as noise in both directions. The window's remaining items are 0.4-3.9 ms *stages*, and the ones
+measured so far are each within ~25% of their own floor (the GR read 410-476 GB/s of 6.5 MB a launch with the dot at
+~12% of it, the expert GEMVs at the 2-bit layout's arithmetic limit, the head arithmetic-bound at 3.26 rows). The
+cheapest thing left that is worth more than the noise is therefore **not** another knob but the draft: 3.10 ms a window
+(13%) buys 2.26 proposals and the 73.5% per-draft acceptance against the 0.1.43 build's 78-82% *with the same draft
+head file* (§2d) - ~1 accepted token a window is ~10% of the window's yield, and drafting costs no quality (the target
+verifies every token it emits).
 
 ## 4. What we did not take, and why
 

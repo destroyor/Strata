@@ -519,6 +519,38 @@ only about a third of it - the R'`*w_norm` staging, the sum-of-squares pass and 
 halving the dot halves a third. The earlier "2 instructions an element x token" model matched the time by coincidence
 and is wrong.
 
+### 2m. The plan wait: why a hybrid device plan is now a code change and not a knob (2026-10-31, last)
+
+The window's per-layer host round trip (`waitA` 0.44 ms profiled: publish the ids, the pool plans, the GPU copies the
+plan) is the largest item left. The E-6 device-plan path exists (`STRATA_VERIFY_DEVICE_PLAN=1`,
+`resident_plan_kernel`/`resident_plan_par_kernel`, `skip_`), but it is all-or-nothing: one non-resident expert sets
+`s_bad` and the kernel writes `skip = 0`, so with a 36% expert cache every layer falls back to the host plan. At ~21
+distinct experts a layer and a 93% hit rate, P(all hit) is ~0.2, so the feature is worth little today.
+
+What makes a *hybrid* one tractable is the combine's shape: `combine_cpu_k10_vec4` walks all `n*K` (token, expert)
+rows and asks whether each row is in the plan's `hit_rows` list; a row that is not gets its value from the CPU's
+mapped rows. **A plan that holds only the resident experts is therefore already a valid input** - the misses need not
+appear in it. Two blockers, both small and both in the numerically critical dispatch:
+
+1. `resident_plan_par_kernel` must skip a non-resident entry instead of bailing, keeping every other entry's `tid`
+   (`dst[..] = i`) and the group prefix sums consistent;
+2. the device-planned branch in `verify.cpp` currently zeroes the CPU rows (`copy_or_zero_from_mapped`); a hybrid group
+   needs the CPU-rows path (wait for `m_flag_`, then the combine's mask picks them up).
+
+Not implemented here: it is a change to the plan/combine protocol, and a silent mistake would show up as a small
+acceptance drift rather than a crash. Estimated value 8-12 us a layer (~0.4 ms, 1.7%).
+
+Six more switches closed on the 32K arm (control 24.45-24.83 ms, 110.2 tok/s, 161/219 accepted):
+
+| arm | ms_fwd | verdict |
+|---|---|---|
+| `STRATA_DOORBELL_STORE=1` (the ring stored, no PCIe read) | 24.85 | neutral |
+| `STRATA_GU_SWIGLU=1` (gate/up + SwiGLU + q8_1 in one launch, the expert path) | 24.50 | neutral |
+| `STRATA_ATTN_LANECELL=1` | - | **crashes on gfx1100**: "verify: layer 3 never rang (an illegal memory access was encountered)" - a gfx906 path, never enable it here |
+| `STRATA_ATTN_MERGE_V2=1` (bitwise batched merge) | 24.43 | neutral |
+| `STRATA_HIP_SWIGLU_FUSED=1` | 24.80 | neutral |
+| `STRATA_ATTN_V3=1` | 24.73 | neutral |
+
 ## 4. What we did not take, and why
 
 - **The fork's tree as a base.** 0.1.43 against 0.1.54 is ~170 commits of upstream work (conversation snapshots,

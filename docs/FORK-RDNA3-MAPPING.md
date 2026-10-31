@@ -641,6 +641,33 @@ verifies every token it emits).
 proposals a window carries, not in the drafter's per-step quality - which is why `--spec 6` / `-min-p 0.25` (§2d, §2e)
 trade tokens for rows and come out flat.
 
+### 2o. The hyper-connection read, measured in isolation (the bench, and why its 300 GB/s is not a bug)
+
+`fused_gr_bench` (a tree target, `STRATA_GR_RDNA=1 build-hip-oct3/fused_gr_bench 200 6 6 8`) times one read at the
+window's T and prints the norm / down / up split from the GPU stamps - one minute an iteration instead of a ten-minute
+arm. Cold weights (8 rotating copies, the engine's case - 26 MB a layer is far past the Infinity Cache):
+
+| | read | norm | down | up | GB/s of 13.1 MB |
+|---|---|---|---|---|---|
+| T 6, cold | 39.4 us | 2.6 | 24.3 | 20.9 | 333 |
+| T 6, warm (1 set) | 32.6 us | 2.6 | ~20 | ~18 | 402 |
+| T 6, cold, `GR_RDNA_RW=1` / `=4` | 44.8 / 53.9 | 2.5 | 31.1 / 37.4 | 20.3 / 22.8 | worse both ways |
+| T 6, cold, `GR_RDNA_FOLD=1` | 44.4 | 2.6 | 24.0 | 25.5 | worse (below) |
+
+Each stamp interval carries a ~2.7 us stamp kernel, so the real down/up are ~2.7 less than the table.
+
+`STRATA_GR_RDNA_FOLD=1` (built and measured, then reverted): the up's 160 blocks each fold all 8 slices' partials into
+`lo` (62 KB of reads a block), so hoisting the fold into one block and having the up copy its T*LR floats instead
+looked like 8.6 MB saved. It is not: those 62 KB are the *whole* `part` buffer, shared by every block and L2-resident,
+so the fold was already nearly free - the extra launch (2.7 us) costs more than the copy saves, 20.9 -> 25.5 us on the
+up stage. Bitwise equal both ways (the bench's check), so the arithmetic was right and only the traffic model was wrong.
+
+**The number that matters:** every one of these kernels - the GR read 333-402 GB/s, the expert GEMVs 295-540, the dense
+GEMVs 344-565 (`q8_gemv_bench`) - lands in the same 300-500 GB/s window, at 1.7 blocks a CU with 41 KB of weights a
+block. That is the card's rate for a *small* GEMV (latency- and issue-bound), not a defect in any one of them: the
+aggregate window reads ~4.5 GB in 19-21 ms, 220 GB/s. Raising it needs more rows per read (a bigger batch), which is
+exactly what the draft-acceptance axis would give (§2n) - not another tile or grid shape.
+
 ## 4. What we did not take, and why
 
 - **The fork's tree as a base.** 0.1.43 against 0.1.54 is ~170 commits of upstream work (conversation snapshots,

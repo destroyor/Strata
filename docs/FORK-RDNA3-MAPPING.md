@@ -446,6 +446,10 @@ the node count matters more than the kernels' shapes. Two consequences measured 
   driver reports 3 blocks x 48 multiprocessors = 144 co-resident blocks against the 168 the down grid needs, so its
   own guard declines rather than risking a deadlock. Making it fit means a 4-slice down grid (84 blocks) and a
   32-column up body (80 blocks) - not done.
+- S26 `STRATA_LFUSE`'s gate+up pair (one launch for the shared expert's two Q8_0 GEMVs) is **neutral** here, and only
+  when its `ar_on()` requirement is relaxed: shared+quant 1.20 -> 1.20 ms, total 22.11 -> 22.13, ms_fwd 25.89 ->
+  25.92. A node is not a fixed 7 us: the four the PCIe share owned were a spin wait and a wide empty launch; a
+  pair launch as wide as the two it replaces saves only its dispatch.
 
 ## 4. What we did not take, and why
 

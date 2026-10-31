@@ -348,20 +348,30 @@ change.
 **The unit's `Environment=STRATA_RDNA_Q6K=1` sat after `[Install]`**, where systemd ignores it: production had been
 running without §2c's +3.5% since it was "deployed". It is now in `[Service]`, together with `STRATA_GR_RDNA=1`.
 
+**The three decode fusions pay again once the window is cheaper.** §2b measured them as neutral (26.42 against
+26.53 ms) on the pre-`GR_RDNA` window and kept them off. With the hyper-connection read down to two launches they are
+worth -0.51 ms (25.95 -> 25.44, twice: 25.51 / 25.37, acceptance unchanged at 73.5%), i.e. **2.0%**: the launch and
+wait overhead they remove is now a larger share of a smaller window. Deployed as `STRATA_COMBINE_CPU=1
+STRATA_WAIT_FUSE=1 STRATA_ROUTE_PUBLISH=1`.
+
 **Negative results, measured today** (all 32K, same protocol):
 
 | arm | ms/window | acceptance | verdict |
 |---|---|---|---|
 | `--mtp-window 4096` / `8192` | 24.68 / 24.85 (vs 25.94) | 73.7% / 69.5% (vs 73.5%) | 1.1 ms cheaper but 0-4 acceptance points: 8192 is a net loss, 4096 a wash at 32K and worse at longer contexts. Not deployed |
 | `--mtp-q4 all` | 26.46 (vs 26.39) | 74.0% | no gain: the draft is not weight-read bound |
-| `STRATA_HC_Q8=1` (int8 hc weights, the existing S23 path) | 25.21 (vs 27.47) | 65.6% (vs 73.2%) | 2.3 ms cheaper (the read is bandwidth-bound: bf16 317 MB/window at 570 GB/s) but 7.6 acceptance points lost - net loss. An int8 `GR_RDNA` read would need a precision fix first |
+| `STRATA_HC_Q8=1` (int8 hc weights, the existing S23 path) | 25.21 (vs 27.47) | 65.6% (vs 73.2%) | 2.3 ms cheaper (the read is bandwidth-bound: bf16 317 MB/window at 570 GB/s) but 7.6 acceptance points lost. 16-prompt median says the same: 101.75 tok/s / 24.53 ms / 68.0% against 105.65 / 25.20 / 71.9 - net loss. The MTP draft has its own hc weights (which stay bf16 either way), so this is the target's own distribution shifting, not a draft/target mismatch |
 | `STRATA_VERIFY_PROFILE=1` | +0.5-2 ms | | the profiler's own cost (the fork's costs 2.4x: 121.6 -> 44.5 tok/s) |
 | `STRATA_HC_REQ8=1` (the other int8 hc route: quantized at load, both reads) | 58.53 (vs 25.94) | 68.7% | 2.3x slower: the prompt path and the single-token reader dequantize the int8 rows into a scratch on every call, so the read is paid 2x plus a dequant per layer |
 | `STRATA_NO_IQ512X1=1` (turns off the AVX512 one-token CPU expert kernel) | 26.09 (vs 25.94) | 73.5% | +0.15 ms only: the CPU share is hidden behind the GPU, so the fork's CPU IQ3_S byte-plane kernel has at most ~0.5% to give on this box - not worth the port (the engine already runs IQ3_S on AVX512) |
+| `--spec-min-p 0.25` (the best of §2e's scan on the old window) | 26.58 (vs 25.94) | 66.4% | more drafts (238 against 219) and a dearer window now: the faster window did not make a lower floor pay. 0.5 stays |
+| `--kv int8 --kv-resident 32768` (the fork's KV) | 26.92 (vs 25.94) | 72.4% | oct3 is both cheaper and just as accepted here: the draft is not KV-noise limited |
+| `STRATA_Q8_PACKED=1` | 26.02 (vs 25.94) | 73.5% | neutral: the dense decode GEMV already runs in its own shape |
 
 Status: `SPEC_CUM` (§2a), the three decode fusions (§2b), the K-quant GEMV (§2c) and the `GR_*` read (§2h) are ported
-and measured; the fusions did not clear the gate and stay off, `SPEC_CUM=0.4`, `STRATA_RDNA_Q6K=1` and
-`STRATA_GR_RDNA=1` are deployed (§2h also fixed the unit line that had kept `RDNA_Q6K` off). §2d lists what did not
+and measured; all of them are deployed now (the fusions only paid once `GR_RDNA` had shrunk the window: §2h),
+`SPEC_CUM=0.4`, `STRATA_RDNA_Q6K=1`, `STRATA_GR_RDNA=1`, `COMBINE_CPU` / `WAIT_FUSE` / `ROUTE_PUBLISH`, PLE direct in
+the config's args (§2h also fixed the unit line that had kept `RDNA_Q6K` off). §2d lists what did not
 move the number. Still to do: the int8 `GR_RDNA` read (blocked on the quality loss in §2h), the wave-32 MMVQ layout
 (`STRATA_RDNA_MMVQ_WAVE`), the CPU IQ3_S byte-plane kernel (mostly idle cores here: 4 pool workers cost only 4%), and
 `PA_KLDS` / `PREFILL_MMQ_TILE_ROWS` (prefill).

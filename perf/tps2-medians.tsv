@@ -93,3 +93,6 @@ p2med-20261031	160000	105.65	25.20	71.9	strata-sc117-iq3_s.json	prod + RDNA_Q6K 
 c3med-20261031	160000	100.25	24.43	66.0	strata-sc117-iq3_s.json	+ mtp-window 4096: 1 ms cheaper, 6 acceptance points gone
 c60-20261031	160000	100.85	24.25	75.6	strata-sc117-iq3_s.json	+ SPEC_CUM 0.6: fewer tokens per window, net loss
 deployed-med-20261031	160000	103.30	24.46	70.8	(deployed unit, port 8089)	prod + RDNA_Q6K + GR_RDNA + PLE direct, measured through the service
+hcq8med-20261031	160000	101.75	24.53	68.0	strata-sc117-iq3_s.json	prod + RDNA_Q6K + HC_Q8 (int8 hc): 0.7 ms cheaper, 4 acceptance points gone
+deployed-fuse-20261031	160000	102.90	25.32	70.8	(deployed unit)	prod + GR_RDNA + PLE direct + COMBINE_CPU/WAIT_FUSE/ROUTE_PUBLISH
+deployed-fuse2-20261031	160000	106.50	25.37	71.5	(deployed unit)	same config, repeat

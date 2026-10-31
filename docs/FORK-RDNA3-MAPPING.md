@@ -634,6 +634,12 @@ cheapest thing left that is worth more than the noise is therefore **not** anoth
 head file* (§2d) - ~1 accepted token a window is ~10% of the window's yield, and drafting costs no quality (the target
 verifies every token it emits).
 
+`STRATA_SPEC_DEPTH=1` on the same arm says the drafter is not the depth-limited part: accepted/tested 71/82 (87%), 51/64
+(80%), 39/47 (83%) at depths 0-2, i.e. **83% conditional** on the prefix being accepted, and no depth 3 attempted inside
+`--spec-min-p 0.5`'s cut. The 73.5% is the unconditional figure (219 proposals, 161 taken); the loss is in how many
+proposals a window carries, not in the drafter's per-step quality - which is why `--spec 6` / `-min-p 0.25` (§2d, §2e)
+trade tokens for rows and come out flat.
+
 ## 4. What we did not take, and why
 
 - **The fork's tree as a base.** 0.1.43 against 0.1.54 is ~170 commits of upstream work (conversation snapshots,

@@ -267,3 +267,37 @@ Built with the engine and run on the same card:
 - The `gfx1100-mmvf-rows1` branch: measured on 0.1.49.2 (23.355 → 23.15 ms per forward, identical `sha_set`), compiled
   on v0.2.8, not re-measured there.
 - Multi-GPU, other cards, other models.
+
+## The deployed service (2026-11-01)
+
+Everything above is per-change. This is the state the production unit runs, and where it ended up.
+
+Three config-level changes, no code involved:
+
+| change | why | what it moved |
+|---|---|---|
+| `--prefill auto:32768` -> `34816` | a 33,065-token prompt crossed the chunk rule and took a **second** full pass over the experts | 3,131 / 3,211 -> **3,467 / 3,517 tok/s** (+9.5%), decode unchanged, `wait copy` 461 -> 18 ms |
+| `--expert-cache 7700` -> `auto`, `--vram-reserve-mib 1024` -> `500` | the engine grows an explicit slot count (7,700 became 9,148-9,200) until the MTP draft head no longer fits: `needs 213 MiB, 74 MiB is free` -> exit 1, and with `Restart=no` the service stays failed | 8,879 slots, 16.84 GiB, **634 MiB free** at start; `ms per forward` 23.03 -> 23.40 (the 154 slots it gives back are worth ~1%) |
+| `--kv-resident 65536` -> `131072` | the streamed KV, not the PLE table, is what a long context reads | a 128K context: 25.78 -> **25.05** ms a forward. Not taken further: 262144 does not start (the draft head again, 74 MiB free) and at 131072 a 256K context already serves **94.95%** of its KV reads from VRAM (437 MiB from RAM) |
+
+The snapshot, one card, one day, the same model and config:
+
+| | as we found it (0.1.49.2 production) | deployed now |
+|---|---|---|
+| prefill 33,072 tokens | 1,880 tok/s | **3,467 / 3,517** (+84%) |
+| prefill 96K | 1,794 tok/s | **3,504 / 3,507 / 3,505** (+96%) |
+| decode, 16-prompt median | 90.00 / 90.65 tok/s | **111.0 / 112.6** (+23-25%) |
+| decode, ms a forward | 24.91 / 25.55 | **23.03 / 23.40** |
+| 128K prompt | - | 3,497 / 3,514 tok/s, 25.05 ms a forward |
+| 256K prompt | - | 3,240 / 3,260 tok/s, 25.96 ms a forward |
+
+Long-context stability, the same day: **82 of 82 requests at 192K-202K contexts** (single conversations of 6,
+8 and 20 turns, then 2 x 12-turn and 3 x 8-turn concurrent conversations), RSS plateauing at 61.5 GiB for one
+conversation and 65 GiB for three under a 72 GiB cgroup, no watchdog fire, no growth across 20 turns; an
+over-long request is refused with a clear 400 rather than truncated and the service stays up. A 200K prompt
+costs 60 s cold and 1.7-2.0 s a turn once the prefix is cached. The harness is `ab/long_multiturn.py` on the
+deployment box (it drives the HTTP API and records RSS and VRAM a turn); it is not part of this repo.
+
+Read the throughput with one caveat: draft acceptance swings 59-76% with the prompt text, so tok/s is only
+comparable between arms that used the same text. `ms per forward` and the engine's own phase table are
+comparable, and every decision recorded here was made on those.

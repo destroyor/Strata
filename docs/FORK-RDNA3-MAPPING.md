@@ -680,6 +680,36 @@ slice's R and `bo_prev` (60 KB at T 6, against 41 KB of weights it owns), and th
 bytes. That is why the read costs 53.5 us a layer in the engine at T 3.26 (26 MB, 490 GB/s warm) and why it is 55%
 fixed: the lever is again the number of rows a read serves, not the kernel.
 
+### 2p. The prompt path: where the 9.6 s of a 33K prompt goes, and the MMQ tile knob is neutral too
+
+With the decode at its floor, the prompt is the other half of what a user waits for: 33,065 tokens take **9.59 s of GPU
+timeline** (`STRATA_PREFILL_TIMING=1`, production env, one run). By phase:
+
+| phase | ms | % | phase | ms | % |
+|---|---|---|---|---|---|
+| **gemm gate/up** | **3118** | **32.5** | combine | 277 | 2.9 |
+| gdn (the layer's own) | 1105 | 11.5 | router+shared | 270 | 2.8 |
+| qsa attn | 1027 | 10.7 | qsa select | 255 | 2.7 |
+| hc read | 711 | 7.4 | gdn conv+gates | 155 | 1.6 |
+| qsa proj | 621 | 6.5 | embed+steps | 109 | 1.1 |
+| hc write | 532 | 5.5 | dequant | 93 | 1.0 |
+| wait copy | 462 | 4.8 | ple | 84 | 0.9 |
+| gdn out proj | 349 | 3.6 | gather / host grouping / kv stage | 31 / 16 / 13 | 0.6 |
+| gdn recurrence | 321 | 3.3 | gemm down (stamp placement) | 39 | 0.4 |
+
+(`gemm down` shows 39 ms, which is the stamp placement - the down's launch sits before its own mark, so its time lands
+in the gate/up bucket; the MoE GEMMs are the gate/up line, 33% or more.)
+
+The gate/up bucket is the routed experts' IQ3_S MMQ: 33K tokens x 61 layers x 10 experts x 2 x 640 x 2560 MACs, 6.6e13
+MACs in 3.1 s = **43 TOPS**, i.e. ~36% of this card's int8 dp4a peak - a gathered MoE GEMM at its usual efficiency, not
+a defect.
+
+`STRATA_PREFILL_MMQ_TILE_ROWS` (the fork's last prefill knob, ported and measured here): it caps the row count the
+MMQ's tile is chosen for. Four arms, pp tok/s: 3155.3 / 3163.0 (64) / 3164.8 (128) / 3147.0 - **+0.4% at most, inside
+the +-0.3% spread**. Reverted. 0.1.54's tile choice is already right for these shapes, which closes the fork's
+prefill list (`PREFILL_MMQ_TILE_ROWS`, `PA_KLDS` - the latter is 0.1.43's kernel; 0.1.54's WMMA prompt kernel already
+prefetches K through a double-buffered chunk).
+
 ## 4. What we did not take, and why
 
 - **The fork's tree as a base.** 0.1.43 against 0.1.54 is ~170 commits of upstream work (conversation snapshots,

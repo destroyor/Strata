@@ -301,3 +301,37 @@ deployment box (it drives the HTTP API and records RSS and VRAM a turn); it is n
 Read the throughput with one caveat: draft acceptance swings 59-76% with the prompt text, so tok/s is only
 comparable between arms that used the same text. `ms per forward` and the engine's own phase table are
 comparable, and every decision recorded here was made on those.
+
+### Rebuilt on current `main` (2026-11-01)
+
+Rebased onto `c62d5e3a` (0.2.8, 170 commits ahead of the base this branch started from) and rebuilt
+(`build-hip-oct3`, `md5 e78294f3`). `kv_octave_parity`, `kv_exact_window_parity` and `hip_prompt_attn_wmma`
+(ctest #21) all pass and print the same checksums as the pre-rebase build, so those 170 commits changed none of
+the oct3, int8 or oct3+window arithmetic.
+
+Two deployment details moved with the rebase:
+
+- On gfx11 the matrix-core prompt attention is now **off** by default (`hip_wmma_mode_env()` returns -1, and gfx12
+  keeps the old default), so `STRATA_PA_OCT=1` needs `STRATA_HIP_WMMA=1` beside it: a reduced env without it read
+  33,072 tokens at 2,995 tok/s.
+- The unit's full environment is the recipe. A first re-test exported only part of it (no `STRATA_GDN_CHUNKED` /
+  `GDN_HEAD` / `GDN_CONVL2` / `GDN_NOY` / `GDN_PP`, `PF_F16`, `PF_HCDOWN`, `STAGER_RING`) and read 3,084 / 3,165
+  prefill and 99.9 decode tok/s. With the unit's full set the same build reads **3,464.5 / 3,568.1 prefill** and
+  **109.5 decode tok/s**, which reproduces the morning's numbers - the subset was the difference, not the box.
+- `STRATA_SELECT_WMMA` is **not** a decode cost. An earlier note here said it added 1.0 ms a forward; that pair came
+  from the reduced-env session. Re-tested under the unit's full set, one session per arm, 16 prompts on a
+  160,000-character prefix: **23.54 ms a forward with it** (113.8 tok/s median, 71.2% acceptance) against **24.09**
+  without (107.05, 72.7%; acceptance differs, so the forward cost is the comparable number). It stays on for the
+  +16.4% of 96K prefill.
+
+The re-run of the deployed unit (`strata-sc117.service`, the env set it exports), one session:
+
+| | first measurement (pre-rebase build) | rebased build, unit env |
+|---|---|---|
+| prefill 33,072 tokens | 3,467 / 3,517 | **3,464.5** (warm **3,440.1**) |
+| prefill 96K | 3,504 / 3,507 / 3,505 | **3,568.1** |
+| decode, 16-prompt median | 111.0 / 112.6 | **109.5** |
+| decode, ms a forward | 23.03 / 23.40 | **23.23** |
+| draft acceptance | 68-73% | 71.0% |
+
+Rebuild and re-run cost nothing measurable; the branch's numbers on current `main` are the branch's numbers.

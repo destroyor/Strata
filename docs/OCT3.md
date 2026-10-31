@@ -133,6 +133,12 @@ The deployed service (the unit, the production config, `perf/raw/perf-deployed-p
 3444** at 32K and **3537 / 3504 / 3507 / 3505** at 96K - the forum's 3.5K, 51% over the oct3 gather path it replaces.
 96K needles on the same service: 3 of 3 at depths 10/50/90.
 
+On gfx11 the arm also needs `STRATA_HIP_WMMA=1`. After the rebase onto current `main` (0.2.8, base `c62d5e3a`) the
+matrix-core prompt attention defaults **off** on gfx11 (gfx12 keeps it on, and `hip_wmma_mode_env()` only turns it on
+when asked), so `STRATA_PA_OCT=1` alone leaves oct3 on the gather path. With both set, the re-run on the rebased
+build (`md5 e78294f3`, the deployed unit's env) read 33,072 tokens at **3,464.5 tok/s** (warm **3,440.1**) and
+99,412 at **3,568.1**; on the earlier reduced env without `STRATA_HIP_WMMA` the same prompts read 2,995 / 2,839.
+
 The 3-bit format now prefills within 1-2% of int8, at 2.4x fewer bytes per cell. Kernel level (synthetic, 2,048
 queries over a 32K context): 8.59 ms per chunk against int8's 8.05 (+6.7%), 4.2x the FP32 path it replaces.
 `HIP_WMMA` alone never helped oct3 because the format gate rejected the call before this arm existed (`2090 / 1928`

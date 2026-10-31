@@ -668,6 +668,18 @@ block. That is the card's rate for a *small* GEMV (latency- and issue-bound), no
 aggregate window reads ~4.5 GB in 19-21 ms, 220 GB/s. Raising it needs more rows per read (a bigger batch), which is
 exactly what the draft-acceptance axis would give (§2n) - not another tile or grid shape.
 
+The read's own T sweep says the same thing from the other side (cold weights, bench `100 1 8 8`):
+
+| T | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| read us | 25.5 | 26.5 | 31.0 | 33.5 | 36.0 | 39.6 | 45.5 | 50.1 |
+| down / up us | 15.5 / 15.5 | 15.2 / 15.2 | 17.4 / 17.3 | 19.5 / 17.8 | 21.4 / 19.0 | 23.4 / 20.2 | 28.5 / 21.5 | 31.0 / 22.8 |
+
+~25 us is the weight stream (T-independent) and ~3.5 us a token is the *staging*: each of the 168 blocks re-reads the
+slice's R and `bo_prev` (60 KB at T 6, against 41 KB of weights it owns), and those 21 blocks a slice read the same
+bytes. That is why the read costs 53.5 us a layer in the engine at T 3.26 (26 MB, 490 GB/s warm) and why it is 55%
+fixed: the lever is again the number of rows a read serves, not the kernel.
+
 ## 4. What we did not take, and why
 
 - **The fork's tree as a base.** 0.1.43 against 0.1.54 is ~170 commits of upstream work (conversation snapshots,

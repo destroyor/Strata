@@ -620,6 +620,7 @@ single-arm result below look like a win):
 | `STRATA_GR_NORM_FAST=1` (the register-staged split norm; gfx12's default, `gr_norm_split_kernel`'s twin) | 24.66 -> 24.80, 24.75 -> 24.84 | **0.1 ms worse**, twice: not the 6 us/launch of a launch-shaped stage |
 | `STRATA_VERIFY_HYBRID_PLAN=1` (this section's own work) | 25.02 -> 25.11 | neutral |
 | `STRATA_EXP_TRIM=<rows>` (the expert group grid's y extent cut to that many block rows - every kernel `launch_gu`/`launch_down` pick strides over the groups, so a window's ~21 groups of the n*K = 60 rows it is sized for leave 2/3 of the grid as blocks that dispatch, read `*n_groups` and exit) | 24.90 -> 24.58, 24.58 -> 24.83, 24.78 -> 24.39, 24.64 -> 24.72 (24 rows) | **neutral**: mean -0.10 ms over four pairs, spread +-0.4. The empty rows are cheaper than a 2.5 ns dispatch each - reverted, not deployed |
+| the 3-bit dequant's level lookup: `kOctLevel[code]` (a lane-varying index into a constant array) as one packed 64-bit immediate shifted by the code (`oct_level`), at all three oct3 sites of `qsa_decode_attn.cu` | attention 0.97 -> 0.94 profiled, draft 3.10 -> 3.25 | **neutral** - the compiler was not paying a serialized constant load there, and the draft's attention did not move. Reverted |
 
 So the hyper-connection norm passes are not launch-bound in the way the 2.7 us-a-node exchange rate suggests: their
 6 us a launch is the read and the reduction, and the staging that replaces it is no cheaper on gfx11.

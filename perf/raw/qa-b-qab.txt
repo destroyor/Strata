@@ -1,0 +1,5 @@
+ready in 1s
+b-qab | : what is the capital of France?              | 'The capital of France is Paris.'
+b-qab | : which chemical element has the symbol Au    | 'The chemical element with the symbol Au is gold.'
+b-qab | hat is 17 * 23?                               | '391'
+

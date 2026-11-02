@@ -1,0 +1,2 @@
+{"label": "tg-txtrnd-warm", "target": 32768, "text": "random", "chars": 168755, "prompt_tokens": 27415, "usage_prompt_tokens": 27415, "pp": 2988.2, "tg": 81.2, "ms_fwd": 28.164285714285715, "acc": 62.33766233766234, "gen": 256, "drafts": 231, "accepted": 144, "wall_s": 12.3}
+{"label": "tg-txtrnd", "target": 32768, "text": "random", "chars": 168755, "prompt_tokens": 27380, "usage_prompt_tokens": 27380, "pp": 3247.8, "tg": 85.4, "ms_fwd": 27.239090909090912, "acc": 66.66666666666667, "gen": 256, "drafts": 219, "accepted": 146, "wall_s": 11.4}

@@ -210,6 +210,18 @@ static void emit_lp_line(const strata::core::Verifier& ver, int t, int32_t token
 
 namespace {
 namespace nib = strata::core::nibble;
+// STRATA_SPEC_CUM=P (opt-in; unset, empty or 0 = off; ported from nicejunjie/Strata-rdna3, itself from
+// android-imdad/Strata-7900xtx): a speculative window also ends where the product of the draft's own probabilities up
+// to that draft (the chance that every draft so far holds) falls below P, beside --spec-min-p's per-draft floor.  It
+// only chooses which drafts are verified - a shorter window is a valid window, and the sample is unchanged.
+double spec_cum_floor() {
+    static const double v = [] {
+        const char* e = std::getenv("STRATA_SPEC_CUM");
+        const double p = e != nullptr ? std::atof(e) : 0.0;
+        return p > 0.0 && p <= 1.0 ? p : 0.0;
+    }();
+    return v;
+}
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
 // a Linux driver has no such limit (#253: the 8 GiB cap cost a 4090 + 3060 split 3x of its prompt speed).
@@ -10204,6 +10216,7 @@ int main(int argc, char** argv) {
             if (st > 0) {
                 stage_ver(st).set_split(o.spec_split);
                 stage_ver(st).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                stage_ver(st).set_pcie_share(o.pcie_frac > 0.0 || o.pcie_frac_auto);
             }
         }
         if (pipe) {   // the odd windows' pool routing: the same as the even ones', with their plans
@@ -10212,6 +10225,7 @@ int main(int argc, char** argv) {
                 split_drive_b.plan[st] = stage_ver_p(st, 1).plan_sink();
                 stage_ver_p(st, 1).set_split(o.spec_split);
                 stage_ver_p(st, 1).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                stage_ver_p(st, 1).set_pcie_share(o.pcie_frac > 0.0 || o.pcie_frac_auto);
             }
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
@@ -10225,6 +10239,7 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        ver.set_pcie_share(o.pcie_frac > 0.0 || o.pcie_frac_auto);
         // --pipeline-windows 2: stage 0's GDN state before a speculative commit, restored when the guess was wrong.
         // Window W reads the state its snapshot must hold and no window writes it (only commits do), so it is copied
         // on a side stream while W runs, into the buffer of W's parity, and only W's speculative commit waits for it
@@ -15991,7 +16006,12 @@ int main(int argc, char** argv) {
                     int T = S_mtp;
                     if (req_spec_min_p > 0.0) {
                         T = 1;
-                        while (T < S_mtp && from + T - 1 < avail && pr[from + T - 1] >= (float) req_spec_min_p) ++T;
+                        double cum = 1.0;   // STRATA_SPEC_CUM: the chance that every draft so far holds
+                        while (T < S_mtp && from + T - 1 < avail && pr[from + T - 1] >= (float) req_spec_min_p) {
+                            cum *= (double) pr[from + T - 1];
+                            if (spec_cum_floor() > 0.0 && cum < spec_cum_floor()) break;
+                            ++T;
+                        }
                     }
                     return std::max(1, std::min(T, 1 + avail - from));
                 };
@@ -16535,7 +16555,12 @@ int main(int argc, char** argv) {
                         T = std::clamp(chain_rows, 1, S_mtp);
                     } else if (use_mtp && req_spec_min_p > 0.0) {
                         T = 1;
-                        while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                        double cum = 1.0;   // STRATA_SPEC_CUM (see t_rule)
+                        while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) {
+                            cum *= (double) dprob[(size_t) T - 1];
+                            if (spec_cum_floor() > 0.0 && cum < spec_cum_floor()) break;
+                            ++T;
+                        }
                     }
                     if (first_window) T = merge_T > 0 ? merge_T : 1;
                     // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
@@ -17933,6 +17958,7 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        ver.set_pcie_share(o.pcie_frac > 0.0 || o.pcie_frac_auto);
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;

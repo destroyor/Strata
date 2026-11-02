@@ -1,0 +1,2 @@
+{"label": "tg-txtrep-warm", "target": 32768, "text": "repeat", "chars": 168755, "prompt_tokens": 32084, "usage_prompt_tokens": 32084, "pp": 3433.0, "tg": 75.7, "ms_fwd": 29.145283018867925, "acc": 62.13592233009709, "gen": 117, "drafts": 103, "accepted": 64, "wall_s": 10.9}
+{"label": "tg-txtrep", "target": 32768, "text": "repeat", "chars": 168755, "prompt_tokens": 7, "usage_prompt_tokens": 32084, "pp": 158.0, "tg": 79.0, "ms_fwd": 27.64367816091954, "acc": 60.23391812865497, "gen": 190, "drafts": 171, "accepted": 103, "wall_s": 2.5}

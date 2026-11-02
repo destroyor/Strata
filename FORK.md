@@ -1,15 +1,19 @@
 # What this fork is
 
 A fork of [Niko1221/Strata](https://github.com/Niko1221/Strata), branched from **v0.2.8** (engine 0.1.54), carrying
-two things this box uses that upstream does not have:
+what this box uses and upstream does not have (or leaves off on gfx1100):
 
 | branch | what | state |
 |---|---|---|
 | `oct3` | `--kv oct3`: K/V as 3-bit Lloyd-Max codes with an exact fp16 window (4 sinks + 1024 newest cells per layer), 448 B/cell | measured on one RX 7900 XTX: quality, prefill, decode, long-context needles; deployed |
+| `fork-accel` | on top of `oct3`: `STRATA_SPEC_CUM` (a cumulative draft-probability floor for the MTP window, ported from nicejunjie/Strata-rdna3) and the rows1 commit | **deployed**: engine 0.1.54 + 22 measured switches + `SPEC_CUM=0.4`; 16-prompt decode 95.6 tok/s, prefill 2243/1979 at 32K/96K, 0 stalls |
 | `gfx1100-mmvf-rows1` | gfx1100 decode tuning: one row per block for the q8_0 GEMV, `STRATA_MMVF_RPB` for the bf16 multi-row GEMV | measured on engine 0.1.49.2, ported and compiled on v0.2.8, **not re-measured there** |
 
 `main` is untouched upstream. Nothing here changes a default of the path it does not name: without `--kv oct3` the
 engine runs exactly what upstream runs, and `oct3` is opt-in.
+
+Also measured, opt-in and not a branch: `perf/presets/gfx1100-prefill.env`, upstream's gfx1151/gfx12 switches on
+gfx1100, +13% prefill at 32K with a prompt-path KL of 0.0138 (`docs/FORK-RDNA3-MAPPING.md` §1).
 
 ## Where the numbers and the instructions are
 

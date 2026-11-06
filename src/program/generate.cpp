@@ -265,6 +265,44 @@ double spec_cum_floor() {
     }();
     return v;
 }
+// STRATA_SPEC_ADAPT_DEPTH=1 (opt-in, A/B): the per-draft floor --spec-min-p follows the drafts' recent acceptance,
+// so a run whose drafts mostly hold reopens the window (cheap rows are worth verifying) and one whose drafts almost
+// all miss narrows it.  Only the window's WIDTH changes: every verified row is accepted or rejected exactly as it
+// was, so the sampled tokens are unchanged.  Bands on the exponential average of accepted/offered per window:
+//   STRATA_SPEC_ADAPT_HI   (0.55)  at or above: floor STRATA_SPEC_ADAPT_HI_P (0.10)
+//   STRATA_SPEC_ADAPT_LOW  (0.30)  below:       floor STRATA_SPEC_ADAPT_LOW_P (0.30)
+//   between the two: --spec-min-p as given;  STRATA_SPEC_ADAPT_ALPHA (0.15) is the average's step.
+struct SpecAdaptDepth {
+    double ema = -1.0;   // -1: no window measured yet
+    double floor = 0.0;
+};
+SpecAdaptDepth& spec_adapt_state() { static thread_local SpecAdaptDepth s; return s; }
+bool spec_adapt_depth_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_SPEC_ADAPT_DEPTH");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return on;
+}
+void spec_adapt_reset() { spec_adapt_state() = SpecAdaptDepth{}; }
+double spec_adapt_floor(double base) {
+    if (!spec_adapt_depth_on()) return base;
+    const SpecAdaptDepth& s = spec_adapt_state();
+    return s.floor > 0.0 ? s.floor : base;
+}
+void spec_adapt_note(double base, int offered, int accepted) {
+    if (!spec_adapt_depth_on() || offered <= 0) return;
+    static const double alpha = [] { const char* e = std::getenv("STRATA_SPEC_ADAPT_ALPHA"); return e != nullptr ? std::atof(e) : 0.15; }();
+    static const double hi    = [] { const char* e = std::getenv("STRATA_SPEC_ADAPT_HI");    return e != nullptr ? std::atof(e) : 0.55; }();
+    static const double lo    = [] { const char* e = std::getenv("STRATA_SPEC_ADAPT_LOW");   return e != nullptr ? std::atof(e) : 0.30; }();
+    static const double hi_p  = [] { const char* e = std::getenv("STRATA_SPEC_ADAPT_HI_P");  return e != nullptr ? std::atof(e) : 0.10; }();
+    static const double lo_p  = [] { const char* e = std::getenv("STRATA_SPEC_ADAPT_LOW_P"); return e != nullptr ? std::atof(e) : 0.30; }();
+    SpecAdaptDepth& s = spec_adapt_state();
+    const double r = (double) accepted / (double) offered;
+    s.ema = s.ema < 0.0 ? r : s.ema + std::clamp(alpha, 0.01, 1.0) * (r - s.ema);
+    s.floor = s.ema >= hi ? hi_p : (s.ema < lo ? lo_p : base);
+}
+
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
 // a Linux driver has no such limit (#253: the 8 GiB cap cost a 4090 + 3060 split 3x of its prompt speed).
@@ -20190,6 +20228,7 @@ int main(int argc, char** argv) {
         };
         int win_cap = o.spec;   // the widest window the VRAM allows (lowered on an out-of-memory capture, see below)
         while ((int64_t) produced.size() < max_new) {
+            if (first_window) spec_adapt_reset();   // the average is this request's, not the previous one's
             const Clock::time_point t0 = Clock::now();
             bool dfr_lookup = false;
             int dfr_T = 0, dfr_match = 0;
@@ -20231,7 +20270,7 @@ int main(int argc, char** argv) {
                 // govern DFlash2's candidates, though the MTP may stay loaded beside it as the fallback (use_mtp)
                 strata::spec::WindowRuleIn wr;
                 wr.use_mtp = use_mtp; wr.draft_on = draft_on; wr.df2_active = spec_uses_df2; wr.spec_cost = spec_cost; wr.first_window = first_window;
-                wr.chain_rows = chain_rows; wr.cap = S_mtp; wr.start = T; wr.spec_min_p = o.spec_min_p;
+                wr.chain_rows = chain_rows; wr.cap = S_mtp; wr.start = T; wr.spec_min_p = spec_adapt_floor(o.spec_min_p);
                 wr.draft_conf = o.draft_conf; wr.dprob = dprob.data();
                 T = strata::spec::choose_window(wr);
             }
@@ -20373,6 +20412,7 @@ int main(int argc, char** argv) {
             ++rounds;
             drafts_total += T - 1;
             drafts_ok += a;
+            spec_adapt_note(o.spec_min_p, T_mtp - 1, a);
             ++accepted_hist[(size_t) a];
             if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
             if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }

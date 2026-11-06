@@ -2490,6 +2490,110 @@ void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, in
 }
 #define STRATA_WAVE_MMVQ(...) \
     if (!g_wave_off) { wave_launch<__VA_ARGS__>(weights, x_q8_1, y, n_in, n_out, ncols, stream); launch_check(); return; }
+#elif defined(STRATA_USE_HIP)
+// ---- RDNA (wave32) layout, ported from nicejunjie/Strata-rdna3 (engine 0.1.49): one wave32 per row, eight waves
+// per block, the row's blocks strided over the 32 lanes.  STRATA_RDNA_MMVQ_WAVE selects it: 1 every shape, 2 the
+// measured small shapes, 3 the exact-order variant (the generic four-warp partial sums emulated inside one wave's
+// registers, no LDS exchange and no block barrier).  Unset or 0 keeps the generic CUDA layout.
+constexpr int NATIVE_WAVE = 32;
+constexpr int NATIVE_WAVES_PER_BLOCK = 256 / NATIVE_WAVE;
+const char* g_rdna_wave_env = std::getenv("STRATA_RDNA_MMVQ_WAVE");
+const bool g_wave_exact = g_rdna_wave_env && std::string(g_rdna_wave_env) == "3";
+const bool g_wave_shapes = g_wave_exact || (g_rdna_wave_env && std::string(g_rdna_wave_env) == "2");
+bool g_wave_off = !(g_wave_exact || g_wave_shapes || (g_rdna_wave_env && std::string(g_rdna_wave_env) == "1"));
+
+template<typename F, int NCOLS>
+__launch_bounds__(256)
+__global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
+                                        float* __restrict__ y, int n_in, int n_out) {
+    constexpr int BPIW = 32 / F::T;
+    static_assert(32 % F::T == 0, "a block's threads must tile the wavefront");
+    const int lane = int(threadIdx.x) & 31;
+    const int row = int(blockIdx.x) * NATIVE_WAVES_PER_BLOCK + int(threadIdx.x) / 32;
+    if (row >= n_out) return;
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    const int kqs = F::kqs(lane);
+    float tmp[NCOLS] = {};
+    for (int kbx = lane / F::T; kbx < blocks_per_row; kbx += BPIW) {
+        const int kby = kbx * F::KBY;
+        const typename F::W wv = F::load(w + std::size_t(row) * blocks_per_row + kbx, kqs);
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) tmp[j] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
+    }
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        float v = tmp[j];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32);
+        if (lane == 0) y[std::size_t(j) * n_out + row] = v;
+    }
+}
+
+// The exact-order variant: the generic layout's four-warp partial sums, emulated in one wave's registers.
+// Same summation order as the generic kernel (so a column's sums do not depend on how many columns ride along),
+// without the LDS exchange and the block barrier.
+template<typename F, int NCOLS>
+__launch_bounds__(256)
+__global__ void native_mmvq_wave_exact_kernel(const typename F::Block* __restrict__ w,
+                                              const Q81Block* __restrict__ x,
+                                              float* __restrict__ y, int n_in, int n_out) {
+    const int lane = int(threadIdx.x) & 31;
+    const int row = int(blockIdx.x) * NATIVE_WAVES_PER_BLOCK + int(threadIdx.x) / 32;
+    if (row >= n_out) return;
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    float tmp[NCOLS][WARPS] = {};
+#pragma unroll
+    for (int g = 0; g < WARPS; ++g) {
+        const int tid = lane + g * WARP;
+        const int kqs = F::kqs(tid);
+        for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += F::BPI) {
+            const typename F::W wv = F::load(w + std::size_t(row) * blocks_per_row + kbx, kqs);
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j)
+                tmp[j][g] += F::apply(wv, x + std::size_t(j) * x_stride + kbx * F::KBY, kqs);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        float v = tmp[j][0];
+#pragma unroll
+        for (int g = 1; g < WARPS; ++g) v += tmp[j][g];
+        v = warp_sum(v);
+        if (lane == 0) y[std::size_t(j) * n_out + row] = v;
+    }
+}
+
+template<typename F, int NCOLS>
+void wave_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
+    const auto* w = static_cast<const typename F::Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const unsigned blocks = unsigned((std::size_t(n_out) + NATIVE_WAVES_PER_BLOCK - 1) / NATIVE_WAVES_PER_BLOCK);
+    if (g_wave_exact) {
+        native_mmvq_wave_exact_kernel<F, NCOLS><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out);
+        return;
+    }
+    native_mmvq_wave_kernel<F, NCOLS><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out);
+}
+
+template<typename F>
+void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
+    const auto s = static_cast<cudaStream_t>(stream);
+    switch (ncols) {
+        case 1: wave_launch_n<F, 1>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 2: wave_launch_n<F, 2>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 3: wave_launch_n<F, 3>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 4: wave_launch_n<F, 4>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 5: wave_launch_n<F, 5>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 6: wave_launch_n<F, 6>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 7: wave_launch_n<F, 7>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 8: wave_launch_n<F, 8>(weights, x_q8_1, y, n_in, n_out, s); break;
+        default: throw std::invalid_argument("native MMVQ (wave) requires 1 <= ncols <= 8");
+    }
+}
+#define STRATA_WAVE_MMVQ(...) \
+    if (!g_wave_off) { wave_launch<__VA_ARGS__>(weights, x_q8_1, y, n_in, n_out, ncols, stream); launch_check(); return; }
 #else
 #define STRATA_WAVE_MMVQ(...)
 #endif

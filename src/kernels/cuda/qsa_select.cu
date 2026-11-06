@@ -2437,7 +2437,6 @@ bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t n
 #endif
 }
 
-#if !defined(__HIPCC__)
 // ---- the decode top-k split over many CTAs, for cards without thread-block clusters (Turing: a decode window's 1-6
 // queries ran block_topk_wide_kernel on 1-6 SMs, ~230 us a call at 420K cells, RTX 2080 Ti).  A query's blocks are
 // cut into chunks of SP_CH; six launches: four radix passes (each chunk adds its 8-bit histogram to the query's global
@@ -2653,10 +2652,16 @@ __global__ void __launch_bounds__(SP_T) topk_split_emit_kernel(const float* __re
     }
 }
 
+static thread_local bool g_split_capture = false;
 bool topk_split_device() {
+    if (g_split_capture) return true;
     static int ok[64] = {};   // 0 unknown, 1 yes, 2 no
     static const int env = [] { const char* v = std::getenv("STRATA_TOPK_SPLIT"); return v ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
     if (env == 0) return false;
+#if defined(__HIPCC__)
+    (void) ok;
+    return env == 1;   // HIP (gfx11): opt-in only, no thread-block clusters here
+#else
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
     if (ok[dev] == 0) {
@@ -2666,6 +2671,7 @@ bool topk_split_device() {
         ok[dev] = (env == 1 || strata::sm75_default(major, minor)) ? 1 : 2;   // Turing, STRATA_SM75_PERF=1
     }
     return ok[dev] == 1;
+#endif
 }
 
 bool qsa_block_topk_split(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
@@ -2675,7 +2681,11 @@ bool qsa_block_topk_split(const float* scores, const int32_t* steps, int64_t nq,
     static void* hist_ptr[64] = {};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+#if defined(__HIPCC__)
+    if (hist_ptr[dev] == nullptr && hipGetSymbolAddress(&hist_ptr[dev], HIP_SYMBOL(g_sp_hist)) != hipSuccess) {
+#else
     if (hist_ptr[dev] == nullptr && cudaGetSymbolAddress(&hist_ptr[dev], g_sp_hist) != cudaSuccess) {
+#endif
         cudaGetLastError();
         hist_ptr[dev] = nullptr;
         return false;
@@ -2690,7 +2700,6 @@ bool qsa_block_topk_split(const float* scores, const int32_t* steps, int64_t nq,
     topk_split_emit_kernel<<<grid, SP_T, 0, s>>>(scores, steps, max_blocks, cap, ids);
     return true;
 }
-#endif
 
 #if !defined(__HIPCC__)
 // ---- the prompt path's top-k with one full read of the scores (Turing).  block_topk_wide_kernel reads a query's scores
@@ -2918,8 +2927,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     if (cluster && !old && nq <= CL_MAXQ && qsa_block_topk_cluster(scores, steps, nq, max_blocks, cap, s, ids, stream))
         return;
 #endif
-#if !defined(__HIPCC__)
-    // Turing decode (a window's few queries, no block count): the split kernels above; the same ids
+    // Turing (and, opt-in, gfx11) decode: a window's few queries on many CTAs; the split kernels above; the same ids
     if (!old && active_blocks <= 0 && max_blocks >= 16384 && s.idx_block == R &&
         cap >= qsa_selection_width(kTopkMaxCells, s) && topk_split_device() &&
         qsa_block_topk_split(scores, steps, nq, max_blocks, cap, ids, (cudaStream_t) stream)) {
@@ -2927,7 +2935,6 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk (split): %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;
     }
-#endif
     // the blocks a query can have: the call's active count when the caller knows it (the prompt path), else the capacity.
     // Decode (no count) keeps the capacity rule and the original register width: nothing changes there.
 #if defined(__HIPCC__)

@@ -1623,6 +1623,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.w_norm = (const float*) wn[half]->data; a.w_down = (const uint16_t*) wd[half]->data;
                 a.w_up = (const uint16_t*) wu[half]->data; a.w_inject = (const uint16_t*) wi[half]->data;
                 a.q8_down = (const uint8_t*) wd[half]->hc_q8; a.q8_up = (const uint8_t*) wu[half]->hc_q8;
+                a.r8_down = (const int8_t*) wd[half]->hc_r8; a.r8_up = (const int8_t*) wu[half]->hc_r8;
                 a.q8_inject = (const uint8_t*) wi[half]->hc_q8;
                 a.s_down = wd[half]->q8_scale; a.s_up = wu[half]->q8_scale;
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
@@ -2636,6 +2637,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.w_norm = (const float*) hn->data; a.w_down = (const uint16_t*) hd->data;
                 a.w_up = (const uint16_t*) hu->data; a.w_inject = nullptr;
                 a.q8_down = (const uint8_t*) hd->hc_q8; a.q8_up = (const uint8_t*) hu->hc_q8;
+                a.r8_down = (const int8_t*) hd->hc_r8; a.r8_up = (const int8_t*) hu->hc_r8;
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.mixed = head_mixed_ + t * N;
                 if (qcnt_ != nullptr) { a.q8_cnt = qcnt_; a.q8_mixed = xq_ + (size_t) (t - h0) * (N / 32) * 36; }

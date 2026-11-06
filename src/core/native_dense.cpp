@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "ggml.h"   // STRATA_GR_RDNA_Q8: other hc formats dequantized for their int8 copies
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -92,6 +93,15 @@ bool hc_q8_name(const std::string& name) {
 }
 // S25: the GGUF keeps the inject rows as F32 - quantized here to Q8_0 (ggml's reference rounding) so the Q8_0 read
 // covers every hc projection
+float half_bits_to_float(uint16_t h) {
+    const uint32_t sign = (uint32_t) (h & 0x8000u) << 16;
+    int32_t e = (int32_t) ((h >> 10) & 0x1f) - 15 + 127;
+    uint32_t m = (uint32_t) (h & 0x3ffu) << 13;
+    if (e <= 0) { const uint32_t sh = (uint32_t) (1 - e); m >>= sh; e = 0; }
+    else if (e >= 255) { m = 0; e = 255; }
+    const uint32_t u = sign | ((uint32_t) e << 23) | m;
+    float f; std::memcpy(&f, &u, 4); return f;
+}
 uint16_t half_bits(float f) {
     uint32_t x;
     std::memcpy(&x, &f, 4);
@@ -425,6 +435,70 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     }
                 }
                 pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data), std::move(packed)});
+            }
+            {   // STRATA_GR_RDNA_Q8=1: int8 + fp16-scale copies of the hyper-connection down/up projections (rdna_gr.cu)
+                static const bool r8 = [] { const char* v = std::getenv("STRATA_GR_RDNA_Q8"); return v && v[0] == '1'; }();
+                if (r8)
+                    for (const auto& tensor : gguf.tensors()) {
+                        // Q8_0 and BF16 as stored; any other format ggml can dequantize through to_float, then per-32
+                        const auto* tt = (tensor.type != 8 && tensor.type != 30) ? ggml_get_type_traits((ggml_type) tensor.type) : nullptr;
+                        const bool other = tt != nullptr && tt->to_float != nullptr && tt->blck_size > 0;
+                        if ((tensor.type != 8 && tensor.type != 30 && !other) || !hc_q8_name(tensor.name) || tensor.shape.size() != 2 ||
+                            tensor.name.ends_with("_inject.weight"))
+                            continue;
+                        auto found = table.table_.find(tensor.name);
+                        if (found == table.table_.end() || found->second.hc_r8 != nullptr) continue;
+                        auto& ref = found->second;
+                        const uint64_t n0 = tensor.shape[0], n1 = tensor.shape[1], n = n0 * n1;
+                        if (n0 != (uint64_t) ref.ne0 || n1 != (uint64_t) ref.ne1 || n0 % 32 != 0) {
+                            err = "native dense (STRATA_GR_RDNA_Q8): incompatible matrix " + tensor.name; return false;
+                        }
+                        const uint64_t soff = (n + 255) / 256 * 256, bytes = soff + n / 32 * 2;
+                        std::vector<uint8_t> host((size_t) bytes, 0);
+                        int8_t* q = (int8_t*) host.data();
+                        uint16_t* sc = (uint16_t*) (host.data() + soff);
+                        const uint8_t* src = (const uint8_t*) gguf.tensor_data(tensor);
+                        std::vector<float> deq;
+                        if (other) {
+                            if (n0 % (uint64_t) tt->blck_size != 0) { err = "native dense (STRATA_GR_RDNA_Q8): block size " + tensor.name; return false; }
+                            deq.resize((size_t) n);
+                            const size_t row_bytes = (size_t) (n0 / (uint64_t) tt->blck_size) * tt->type_size;
+                            for (uint64_t r = 0; r < n1; ++r) tt->to_float(src + r * row_bytes, deq.data() + r * n0, (int64_t) n0);
+                        }
+                        for (uint64_t b = 0; b < n / 32; ++b) {
+                            if (tensor.type == 8) {                       // Q8_0: fp16 d + 32 int8, as stored
+                                std::memcpy(&sc[b], src + b * 34, 2);
+                                std::memcpy(q + b * 32, src + b * 34 + 2, 32);
+                            } else {                                      // BF16: quantized per 32 on the stored fp16 scale
+                                float x[32], amax = 0.0f;
+                                for (int j = 0; j < 32; ++j) {
+                                    if (other) x[j] = deq[(size_t) (b * 32 + j)];
+                                    else {
+                                        uint16_t h; std::memcpy(&h, src + (b * 32 + j) * 2, 2);
+                                        const uint32_t u = (uint32_t) h << 16; std::memcpy(&x[j], &u, 4);
+                                    }
+                                    amax = (std::max)(amax, std::fabs(x[j]));
+                                }
+                                const uint16_t hb = half_bits(amax / 127.0f);
+                                sc[b] = hb;
+                                const float d = half_bits_to_float(hb), id = d != 0.0f ? 1.0f / d : 0.0f;
+                                for (int j = 0; j < 32; ++j) {
+                                    const long v = std::lround(x[j] * id);
+                                    q[b * 32 + j] = (int8_t) (v > 127 ? 127 : v < -127 ? -127 : v);
+                                }
+                            }
+                        }
+                        void* p = nullptr;
+                        if (cudaMalloc(&p, bytes) != cudaSuccess || cudaMemcpy(p, host.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                            err = "native dense (STRATA_GR_RDNA_Q8) upload " + tensor.name; return false;
+                        }
+                        ref.hc_r8 = p;
+                        weights_.push_back(p);
+                        hc_q8_bytes += bytes;
+                        if (!strata::kernels::rdna_r8_scratch_init((long long) n)) {
+                            err = "native dense (STRATA_GR_RDNA_Q8): scratch allocation"; return false;
+                        }
+                    }
             }
             if (hc_q8_env())
                 for (const auto& tensor : gguf.tensors()) {

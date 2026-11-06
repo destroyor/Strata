@@ -47,6 +47,8 @@ struct FusedGrArgs {
     /// bytes native_quantize_q8_1 would write); q8_cnt = n_embd / 32 zeroed counters owned by the caller (token 0's)
     uint8_t* q8_mixed = nullptr;
     unsigned* q8_cnt = nullptr;
+    const int8_t* r8_down = nullptr;   ///< STRATA_GR_RDNA_Q8: int8 [hc_lr][hc*n_embd] + fp16 scales (rdna_gr.cu layout)
+    const int8_t* r8_up = nullptr;     ///< int8 [hc*n_embd][hc_lr] + fp16 scales
     /// STRATA_HC_Q8: non-null when w_down / w_up hold int8 codes (same [row][col] layout) with one fp32 scale per
     /// 32 contiguous values here ([row][col / 32]).  w_inject stays bf16.
     const float* s_down = nullptr;
@@ -80,6 +82,10 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
 /// up projection folding the partials) instead of six, another summation order (not bitwise).  `scratch` is the
 /// caller's xn scratch (n_tok * hc * n_embd floats; the read needs far less).
 bool rdna_gr_enabled();
+/// STRATA_GR_RDNA_Q8: the per-device scratch the r8 -> BF16 image needs (one allocation per role), sized in elements.
+bool rdna_r8_scratch_init(long long elems);
+/// The BF16 image of an r8 matrix (rows x cols), dequantized on `stream`; nullptr when the scratch is missing.
+const uint16_t* rdna_r8_to_bf16(const int8_t* r8, long long rows, long long cols, int role, void* stream);
 void rdna_gr_read_multi(const FusedGrArgs* a, int n_tok, float* scratch, void* stream,
                         unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
 

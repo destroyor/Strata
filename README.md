@@ -11,7 +11,7 @@ A performance-tuned fork of [Strata](https://github.com/Niko1221/Strata) for a *
 This branch (`main`) tracks the **production deployment** exactly. It is the upstream Strata engine plus a small set of measured, quality-gated patches and a documented runtime configuration for one specific machine. It is **not** a general-purpose tuning; the numbers below are for this hardware/model pair and will not transfer unchanged to other setups.
 
 - **Engine**: Strata 0.1.57 (HIP build), base `oct3-v0211` (`29cdbca2`) + the patches below.
-- **Production binary sha256**: `2c642b12b6f0ae9e347bba6b64cd71bc9b5d0b2350392f3a6797c7f110981bfc`.
+- **Production binary sha256**: `1cce3b0dc5b14daa4552dc4809a7a58906a6c3b27602f278a23a0ca21e459aee`.
 
 ## Hardware / model target
 
@@ -19,7 +19,7 @@ This branch (`main`) tracks the **production deployment** exactly. It is the ups
 |---|---|
 | GPU | AMD RX 7900 XTX, 24 GB, gfx1100 (RDNA3, wave32), 960 GB/s |
 | CPU / RAM | Ryzen 9 9950X / 91 GiB |
-| ROCm | 10.2.0 |
+| ROCm | 10.3.0 |
 | Model | Swift-Qwen3.8-Flash-Next GSQ-RCO-abliterated **IQ3_S** + Lamina MTP |
 | Context | 262144, **oct3** (3-bit octave) KV |
 | Serve | OpenAI-compatible API, port 8089 |
@@ -103,7 +103,7 @@ Backups are kept beside the production binary (`engine/strata.bak-*`) and unit (
 `main` 分支与**生产部署完全一致**：上游 Strata 引擎 + 少量经过实测与质量门禁的补丁 + 针对这台机器的运行配置。它**不是**通用调优，下面的数字只对这套硬件/模型成立，不能原样搬到别的配置。
 
 - **引擎**：Strata 0.1.57（HIP 构建），基线 `oct3-v0211`（`29cdbca2`）+ 下述补丁。
-- **生产二进制 sha256**：`2c642b12b6f0ae9e347bba6b64cd71bc9b5d0b2350392f3a6797c7f110981bfc`。
+- **生产二进制 sha256**：`1cce3b0dc5b14daa4552dc4809a7a58906a6c3b27602f278a23a0ca21e459aee`。
 
 ## 硬件 / 模型
 
@@ -111,7 +111,7 @@ Backups are kept beside the production binary (`engine/strata.bak-*`) and unit (
 |---|---|
 | GPU | AMD RX 7900 XTX，24 GB，gfx1100（RDNA3，wave32），960 GB/s |
 | CPU / 内存 | Ryzen 9 9950X / 91 GiB |
-| ROCm | 10.2.0 |
+| ROCm | 10.3.0 |
 | 模型 | Swift-Qwen3.8-Flash-Next GSQ-RCO-abliterated **IQ3_S** + Lamina MTP |
 | 上下文 | 262144，**oct3**（3-bit octave）KV |
 | 服务 | OpenAI 兼容 API，端口 8089 |

@@ -1165,14 +1165,12 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
                                                           scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     else
 #endif
-    if (kv_mode == 4) {
-        if (pre) {
-            std::fprintf(stderr, "oct3 KV: the pre-sm_75 attention kernel has no oct3 mode\n");
-            std::exit(1);
-        }
-        attn_chunk_kernel<4><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
-                                                       scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
-    } else if (kv_mode == 3)
+    if (kv_mode == 4)
+        // E18: oct3 uses the batched pre75 gather (NC cells/step) when pre (STRATA_ATTN_DAILY=1);
+        // pre=false keeps attn_chunk_kernel<4>, byte-identical to before. Body already supports oct3.
+        STRATA_ATTN_CHUNK_SEL(4, pre)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                                scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+    else if (kv_mode == 3)
         STRATA_ATTN_CHUNK_SEL(3, pre)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv,
                                                                 (int) s.page_size, scale, part_acc, part_m, part_l,
                                                                 n_chunks, (int) cap, stride);

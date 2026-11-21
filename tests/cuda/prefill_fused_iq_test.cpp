@@ -658,6 +658,7 @@ int main(int argc, char** argv) {
 #else
         if (unset_pf) unsetenv("STRATA_PF_FUSED"); else setenv("STRATA_PF_FUSED", "1", 1);
         setenv("STRATA_PF_FUSED_KQ", "1", 1);   // (the HIP build's Q4_K / Q5_K / Q5_1 / Q8_0 pairs)
+        setenv("STRATA_PF_FUSED_Q50", "1", 1);  // (the Q5_0 down pairs; opt-in, needs STRATA_PF_F16)
 #endif
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
@@ -695,6 +696,8 @@ int main(int argc, char** argv) {
             // the Coder IQ1_M pack's other pairs (appended: the default timing set takes pairs 0, 1, 4, 3 by index)
             {GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, "IQ2_S / IQ4_NL"},   {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0, "IQ3_XXS / Q2_0"},
             {GGML_TYPE_IQ3_S, GGML_TYPE_Q2_0, "IQ3_S / Q2_0"},       {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, "IQ4_XS / IQ4_NL"},
+            // UD-IQ4_XS-v31's Q5_0 down layers (opt-in STRATA_PF_FUSED_Q50=1; the build has no Q5_0 MMQ, so reference only)
+            {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0, "IQ3_XXS / Q5_0"},   {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0, "IQ4_XS / Q5_0"},
             // the canonical Q2_0 pack (gate/up and down Q2_0; CUDA)
             {GGML_TYPE_Q2_0, GGML_TYPE_Q2_0, "Q2_0 / Q2_0"}};
         const char* only = nullptr;   // --only=NAME: the pairs whose name contains NAME

@@ -2961,11 +2961,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                          skip_ + grp, ring, cs);
             } else if (cfuse_on(n)) {
+                // The combine reads the mapped CPU rows directly; copying them here would dereference
+                // the device-plan skip pointer even though cfuse_on requires !device_plan_.
                 if (!fuse_wait_on()) wait_flag_ge(m_flag_, ring, cs);
                 stamp(l, 23, grp);
-                wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
-                copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
-                                         skip_ + grp, ring, cs);
             } else {
                 const bool fuse_rows = fuse_rows_on() && !prof_on_ && !remote_opt_ && dec_batch && m_bal_ == nullptr;   // 143-amdk
                 if (!fuse_rows) {

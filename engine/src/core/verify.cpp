@@ -51,6 +51,7 @@
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_octave.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/megakernel.hpp"
@@ -345,6 +346,8 @@ const bool g_trace = env_on("STRATA_VERIFY_TRACE");
 // STRATA_LAUNCH_PROBE (STRIX-TDR): process start, and the first windows' launch timing
 const Clock::time_point g_proc_t0 = Clock::now();
 Clock::time_point probe_proc_t0() { return g_proc_t0; }
+// STRATA_ROUTE_PUBLISH=1: the window's top-10 and its doorbell publish in one launch (native_router_top10_publish*)
+const bool g_route_publish = env_on("STRATA_ROUTE_PUBLISH");
 const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
 const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
 // STRATA_BATCH_SELF_COMMIT=1 (opt-in): a batch window whose rows are each another slot's one token keeps them itself,
@@ -515,7 +518,10 @@ bool fuse_wait_on() {
 // 143-amdk's rows version of the folded wait (copy_rows_from_mapped_after): HIP with fuse_wait_on, CUDA STRATA_FUSE_WAIT=1
 bool fuse_rows_on() {
 #if defined(STRATA_USE_HIP)
-    return fuse_wait_on();
+    // STRATA_FUSE_WAIT=2 (the CUDA meaning: the plan's wait only) is the fork's STRATA_WAIT_FUSE - one launch fewer for
+    // the plan, the rows' copy left as it was
+    static const int env = [] { const char* v = std::getenv("STRATA_FUSE_WAIT"); return v != nullptr ? std::atoi(v) : -1; }();
+    return fuse_wait_on() && env != 2;
 #else
     static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_WAIT"); return v != nullptr && std::atoi(v) == 1; }();
     return on;
@@ -1524,6 +1530,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                shared_expert_native_bf16_enabled();
     };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
+    // STRATA_COMBINE_CPU=1: with CPU experts, the combine reads the CPU rows from the mapped buffer and the GPU's from
+    // hit_out (no copy_rows_from_mapped / moe_hit_add launches), bitwise the launches it replaces
+    static const bool g_cfuse = env_on("STRATA_COMBINE_CPU");
+    auto cfuse_on = [&](int n) {
+        return g_cfuse && !ar_on() && !device_plan_ && !remote_opt_ && K == 10 && native_moe_combine_enabled() &&
+               dec_batch && n > 1 && n <= 8 && shared_expert_native_bf16_enabled() &&
+               strata::kernels::cpu::expert_layout().native && (N & 3) == 0;
+    };
     if (!batch_rec_) groups_[T] = G;
     // Programmatic dependent launch (pdl.hpp; sm_90+, opt-in: STRATA_DF_PDL=1): the window's quantizations and dense
     // projections may start while the kernel before them finishes, loading their weights before they wait for its
@@ -2363,7 +2377,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                            kc_b, kc_b, (int) (NKV * HD), n, s, cs, mirror ? &hk : nullptr);
                         kv_append_q4_steps(st.v_q4, st.v_q4, st.page_table, step_b, kStepCount, n, vc_b, vc_b, s, cs,
                                            mirror ? &hv : nullptr);
-                    } else if (st.kv_q4)
+                    } else if (st.kv_oct) {
+                        kv_append_oct_steps(st.k_q4, st.v_q4, st.page_table, step_b, kStepCount, n, kc_b, vc_b, s, cs,
+                                            &st.host);
+                        // the exact window: the same rotated K/V, fp16, for the cells it keeps (kv_exact_window.hpp)
+                        strata::kernels::kv_exact_window_append(st.win, 0, step_b, kc_b, vc_b, n, cs);
+                    }
+                    else if (st.kv_q4)
                         kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_b, kStepCount, n, kc_b, vc_b, s, cs,
                                            &st.host);
                     else if (st.kv_int8)
@@ -2397,6 +2417,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                             kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vc, vc, s, cs,
                                               mirror ? &hv : nullptr);
                         }
+                    } else if (st.kv_oct) {
+                        if (m > 1)
+                            kv_append_oct_steps(st.k_q4, st.v_q4, st.page_table, step_t, kStepCount, m, kc, vc, s, cs, &st.host);
+                        else
+                            kv_append_oct_step(st.k_q4, st.v_q4, st.page_table, step_t, kc, vc, s, cs, &st.host);
+                        strata::kernels::kv_exact_window_append(st.win, 0, step_t, kc, vc, m, cs);
                     } else if (st.kv_q4) {
                         if (m > 1) kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_t, kStepCount, m, kc, vc, s, cs, &st.host);
                         else kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kc, vc, s, cs, &st.host);
@@ -2633,6 +2659,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
+        // STRATA_ROUTE_PUBLISH=1: the top-10 and the doorbell publish in one launch (the path doorbell_publish_res takes)
+        const bool rpub_base = g_route_publish && dec_batch && n > 1 && n <= 8 && w_router != nullptr &&
+                               native_router_enabled() && NE == 512 && K == 10 && !ar_on() && !device_plan_ &&
+                               !remote_opt_ && g_route_prior() <= 0.0f && route_resident_cfg().margin <= 0.0f
+#if defined(STRATA_USE_HIP)
+                               && !g_doorbell_store
+#endif
+            ;
+        const bool rpub = rpub_base && !always_publish_, rpub_all = rpub_base && always_publish_;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 if (w_sgi != nullptr)
@@ -2642,6 +2677,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
+                if (rpub_all)
+                    native_router_top10_publish(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm, (int64_t) n * N,
+                                                m_x_ + tb * N, m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+                else if (rpub)
+                    native_router_top10_publish_res(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm,
+                                                    hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr,
+                                                    (int) g.n_expert, (int64_t) n * N, m_x_ + tb * N, m_ids_ + tb * K,
+                                                    m_seq_, cs);
+                else
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
         } else if (dec_batch && route_window_on()) {
@@ -2696,7 +2740,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                               hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                               plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
-                              (uint32_t) ((l - lb_) * G + grp + 1), cs);
+                              (uint32_t) ((l - lb_) * G + grp + 1), cs, m_plan_err_);
 #if defined(STRATA_USE_HIP)
             if (g_doorbell_store)   // #649 A/B: the step's ring stored, not incremented over PCIe
                 doorbell_publish_value(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
@@ -2705,10 +2749,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 #endif
             // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
             // whatever the device's residency table says (pipelined windows)
-            if (remote_opt_ || always_publish_)
+            if (rpub_all) {
+                // published with the routing above
+            } else if (remote_opt_ || always_publish_)
                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
-            else {
+            else if (!rpub) {
                 const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
                 doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
                                      m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
@@ -2878,6 +2924,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out, true);
             stamp(l, 20, grp);
+            // --pcie-frac 0 and no balance model: the plan never holds a PCIe group, so the whole share - its staging
+            // wait, the fetch/rebase kernels and the empty grouped launch (11 us a layer on gfx1100) - is skipped.
+            const bool pcie_share = sink_.pcie_share || m_bal_ != nullptr;
+            if (pcie_share) {
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
                 wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
@@ -2905,7 +2955,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 note_prio_tail(sh_cs_, -1);
                 cudaEventRecord(ev_join_, sh_cs_);
             }
-            if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
+            }
+            if (device_plan_ && !cfuse_on(n)) {
+                wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
+                copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
+                                         skip_ + grp, ring, cs);
+            } else if (cfuse_on(n)) {
+                if (!fuse_wait_on()) wait_flag_ge(m_flag_, ring, cs);
+                stamp(l, 23, grp);
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                          skip_ + grp, ring, cs);
@@ -2929,12 +2986,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 else
                     copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
-            // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer)
-            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
-                              native_moe_combine_enabled() && n <= 8 &&
+            // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer); with
+            // STRATA_COMBINE_CPU the CPU-row combine reads the hit rows itself
+            hits_in_combine = !cfuse_on(n) && fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch &&
+                              n > 1 && native_moe_combine_enabled() && n <= 8 &&
                               native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
             strata::dispatch::notef("experts layer: cpu rows via %ld (1 = fused wait+copy, 0 = wait then copy), hits in combine=%ld", (long) (fuse_rows_on() && !prof_on_ && !remote_opt_ && dec_batch && m_bal_ == nullptr), (long) hits_in_combine);
-            if (!hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
+            if (!cfuse_on(n) && !hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
         }
         // Same condition as `sh_fork` above, which is per group and out of scope here: wait only when the fork
         // actually ran (a wait on an event never recorded is a no-op, but saying it outright reads better).
@@ -2945,6 +3003,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
                 native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
+            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+        } else
+        if (cfuse_on(n)) {
+            try {
+                native_moe_combine_multi_cpu(m_ymiss_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
+                                             shared_ + tb * N, bo_ + tb * N, N, n, cs,
+                                             fuse_wait_on() ? m_flag_ : nullptr, ring);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         if (hits_in_combine) {

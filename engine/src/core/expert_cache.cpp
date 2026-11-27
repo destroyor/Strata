@@ -2,9 +2,9 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_cache_refuse.hpp"
 
-// #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
-// the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
+// #533's segmented cache uses driver virtual memory management: CUDA cuMem* or HIP hipMem*.
+// The gfx906 compat build and Metal keep the single-allocation path.
+#if defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
 #define STRATA_EC_NO_VMM 1
 #endif
 
@@ -441,7 +441,14 @@ bool map_segment(int dev, uintptr_t va, size_t bytes, unsigned long long& handle
 static bool segmented_supported() {
 #if defined(STRATA_USE_HIP)
     int dev = 0;
-    return vmm_available() && hipGetDevice(&dev) == hipSuccess;
+    hipMemAllocationProp prop{};
+    prop.type = hipMemAllocationTypePinned;
+    prop.location.type = hipMemLocationTypeDevice;
+    prop.location.id = dev;
+    prop.requestedHandleType = hipMemHandleTypeNone;
+    size_t gran = 0;
+    return hipGetDevice(&dev) == hipSuccess &&
+           hipMemGetAllocationGranularity(&gran, &prop, hipMemAllocationGranularityMinimum) == hipSuccess && gran > 0;
 #else
     const Vmm& v = vmm();
     int dev = 0, supported = 0;
@@ -459,7 +466,7 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
     return false;
 #elif defined(STRATA_USE_HIP)
     int dev = 0;
-    if (!vmm_available() || hipGetDevice(&dev) != hipSuccess) {
+    if (hipGetDevice(&dev) != hipSuccess) {
         (void) hipGetLastError();
         err = "ExpertCache: --vram-elastic needs the driver virtual memory management, which this GPU or driver does not offer";
         return false;

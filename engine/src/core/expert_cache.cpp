@@ -11,7 +11,9 @@
 #include <thread>
 #include <mutex>
 #include <cuda_runtime.h>
-#if !defined(STRATA_EC_NO_VMM)
+#if defined(STRATA_USE_HIP) && !defined(STRATA_EC_NO_VMM)
+#include <hip/hip_runtime.h>
+#elif !defined(STRATA_EC_NO_VMM)
 #include <cuda.h>   // #533: the virtual memory management types (the functions come through the runtime's entry points)
 #endif
 
@@ -323,7 +325,7 @@ bool (*refuse_segment_call)(const char* call, int64_t seg) = nullptr;
 // ---- #533: the segmented arena (--vram-elastic).  The driver API's virtual memory functions, looked up through the
 // runtime (no link against the driver library): one address range for the whole arena, backed by physical segments,
 // and the tail's segments unmapped / mapped again later.  Nothing here runs unless a segment size was set.
-#if !defined(STRATA_EC_NO_VMM)
+#if !defined(STRATA_EC_NO_VMM) && !defined(STRATA_USE_HIP)
 namespace {
 struct Vmm {
     CUresult (CUDAAPI* device_get)(CUdevice*, int) = nullptr;
@@ -401,22 +403,104 @@ bool map_segment(const Vmm& v, int dev, CUdeviceptr va, size_t bytes, unsigned l
 }  // namespace
 #endif
 
+#if defined(STRATA_USE_HIP) && !defined(STRATA_EC_NO_VMM)
+namespace {
+hipMemAllocationProp device_prop(int dev) {
+    hipMemAllocationProp prop{};
+    prop.type = hipMemAllocationTypePinned;
+    prop.location.type = hipMemLocationTypeDevice;
+    prop.location.id = dev;
+    prop.requestedHandleType = hipMemHandleTypeNone;
+    return prop;
+}
+
+bool map_segment(int dev, uintptr_t va, size_t bytes, unsigned long long& handle) {
+    const hipMemAllocationProp prop = device_prop(dev);
+    hipMemGenericAllocationHandle_t h = nullptr;
+    if (hipMemCreate(&h, bytes, &prop, 0) != hipSuccess) return false;
+    if (hipMemMap((void*) va, bytes, 0, h, 0) != hipSuccess) {
+        (void) hipMemRelease(h);
+        return false;
+    }
+    hipMemAccessDesc access{};
+    access.location.type = hipMemLocationTypeDevice;
+    access.location.id = dev;
+    access.flags = hipMemAccessFlagsProtReadWrite;
+    if (hipMemSetAccess((void*) va, bytes, &access, 1) != hipSuccess) {
+        (void) hipMemUnmap((void*) va, bytes);
+        (void) hipMemRelease(h);
+        return false;
+    }
+    handle = (unsigned long long) (uintptr_t) h;
+    return true;
+}
+}  // namespace
+#endif
+
 #if !defined(STRATA_EC_NO_VMM)
-// the driver and this GPU offer the virtual memory functions the segmented arena needs (the check open_segmented makes first)
 static bool segmented_supported() {
+#if defined(STRATA_USE_HIP)
+    int dev = 0;
+    return vmm_available() && hipGetDevice(&dev) == hipSuccess;
+#else
     const Vmm& v = vmm();
     int dev = 0, supported = 0;
     CUdevice cu = 0;
     return v.ok && cudaGetDevice(&dev) == cudaSuccess && v.device_get(&cu, dev) == CUDA_SUCCESS &&
            v.attribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu) == CUDA_SUCCESS && supported;
+#endif
 }
 #endif
 
 bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
 #if defined(STRATA_EC_NO_VMM)
     (void) want;
-    err = "ExpertCache: --vram-elastic (a segmented expert cache) is CUDA-only for now";
+    err = "ExpertCache: --vram-elastic (a segmented expert cache) is not available on this backend";
     return false;
+#elif defined(STRATA_USE_HIP)
+    int dev = 0;
+    if (!vmm_available() || hipGetDevice(&dev) != hipSuccess) {
+        (void) hipGetLastError();
+        err = "ExpertCache: --vram-elastic needs the driver virtual memory management, which this GPU or driver does not offer";
+        return false;
+    }
+    const hipMemAllocationProp prop = device_prop(dev);
+    size_t gran = 0;
+    if (hipMemGetAllocationGranularity(&gran, &prop, hipMemAllocationGranularityMinimum) != hipSuccess || gran == 0) {
+        (void) hipGetLastError();
+        err = "ExpertCache: cannot read the driver allocation granularity";
+        return false;
+    }
+    const uint64_t min_g = 2ull << 20;
+    const uint64_t g = (uint64_t) gran >= min_g ? (uint64_t) gran
+                                               : (min_g + (uint64_t) gran - 1) / (uint64_t) gran * (uint64_t) gran;
+    const uint64_t total = (want + g - 1) / g * g;
+    seg_ = (int64_t) (((uint64_t) seg_req_ + g - 1) / g * g);
+    void* va = nullptr;
+    if (hipMemAddressReserve(&va, (size_t) total, 0, nullptr, 0) != hipSuccess) {
+        (void) hipGetLastError();
+        err = "ExpertCache: cannot reserve the address range of the segmented expert cache";
+        return false;
+    }
+    base_ = reinterpret_cast<uint8_t*>(va);
+    reserved_ = total;
+    for (uint64_t at = 0; at < total; at += (uint64_t) seg_) {
+        segs_.push_back(0);
+        seg_size_.push_back((int64_t) std::min<uint64_t>((uint64_t) seg_, total - at));
+    }
+    for (size_t i = 0; i < segs_.size(); ++i) {
+        if (!map_segment(dev, (uintptr_t) va + (uint64_t) i * (uint64_t) seg_, (size_t) seg_size_[i], segs_[i])) {
+            (void) hipGetLastError();
+            char buf[240];
+            std::snprintf(buf, sizeof buf, "ExpertCache: segment %zu of %zu (%.2f GiB) of the segmented cache could not be allocated",
+                          i + 1, segs_.size(), (double) seg_size_[i] / 1073741824.0);
+            err = buf;
+            release_segmented();
+            return false;
+        }
+        mapped_segs_ = (int64_t) i + 1;
+    }
+    return true;
 #else
     const Vmm& v = vmm();
     int dev = 0, supported = 0;
@@ -466,7 +550,17 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
 }
 
 void ExpertCache::release_segmented() {
-#if !defined(STRATA_EC_NO_VMM)
+#if defined(STRATA_USE_HIP) && !defined(STRATA_EC_NO_VMM)
+    if (base_ != nullptr) (void) hipDeviceSynchronize();
+    const uintptr_t va = reinterpret_cast<uintptr_t>(base_);
+    for (size_t i = 0; i < segs_.size(); ++i) {
+        if (segs_[i] == 0) continue;
+        if (i < (size_t) mapped_segs_)
+            (void) hipMemUnmap((void*) (va + (uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i]);
+        (void) hipMemRelease((hipMemGenericAllocationHandle_t) (uintptr_t) segs_[i]);
+    }
+    if (base_ != nullptr && reserved_ > 0) (void) hipMemAddressFree((void*) va, (size_t) reserved_);
+#elif !defined(STRATA_EC_NO_VMM)
     const Vmm& v = vmm();
     if (base_ != nullptr) cudaDeviceSynchronize();
     const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
@@ -508,6 +602,38 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
 #if defined(STRATA_EC_NO_VMM)
     (void) keep_bytes;
     return false;
+#elif defined(STRATA_USE_HIP)
+    int64_t keep = 0, at = 0;
+    while (keep < (int64_t) segs_.size() && at < keep_bytes) at += seg_size_[(size_t) keep++];
+    if (keep >= mapped_segs_) return true;
+    if (hipDeviceSynchronize() != hipSuccess) {
+        (void) hipGetLastError();
+        err = "the device failed before the cache shrank";
+        return false;
+    }
+    const uintptr_t va = reinterpret_cast<uintptr_t>(base_);
+    auto refused = [](const char* call, int64_t seg) {
+        return ec_test::refuse_segment_call != nullptr && ec_test::refuse_segment_call(call, seg);
+    };
+    for (int64_t i = mapped_segs_ - 1; i >= keep; --i) {
+        const uintptr_t p = va + (uint64_t) i * (uint64_t) seg_;
+        if (refused("unmap", i) || hipMemUnmap((void*) p, (size_t) seg_size_[(size_t) i]) != hipSuccess) {
+            (void) hipGetLastError();
+            err = "the driver refused to release an expert-cache segment";
+            live_slots_ = slots_within(mapped_bytes());
+            return false;
+        }
+        mapped_segs_ = i;
+        if (refused("release", i) || hipMemRelease((hipMemGenericAllocationHandle_t) (uintptr_t) segs_[(size_t) i]) != hipSuccess) {
+            (void) hipGetLastError();
+            err = "the driver refused to release an expert-cache segment";
+            live_slots_ = slots_within(mapped_bytes());
+            return false;
+        }
+        segs_[(size_t) i] = 0;
+    }
+    live_slots_ = slots_within(mapped_bytes());
+    return true;
 #else
     const Vmm& v = vmm();
     int64_t keep = 0, at = 0;   // the segments [0, keep) hold the first keep_bytes
@@ -549,6 +675,33 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
 #if defined(STRATA_EC_NO_VMM)
     (void) want_bytes;
     return false;
+#elif defined(STRATA_USE_HIP)
+    int dev = 0;
+    (void) hipGetDevice(&dev);
+    const uintptr_t va = reinterpret_cast<uintptr_t>(base_);
+    int64_t at = mapped_bytes();
+    while (mapped_segs_ < (int64_t) segs_.size() && at + seg_size_[(size_t) mapped_segs_] <= want_bytes) {
+        const size_t i = (size_t) mapped_segs_;
+        if (segs_[i] != 0) {
+            if (hipMemRelease((hipMemGenericAllocationHandle_t) (uintptr_t) segs_[i]) != hipSuccess) {
+                (void) hipGetLastError();
+                err = "the driver has no VRAM for another expert-cache segment";
+                live_slots_ = slots_within(mapped_bytes());
+                return false;
+            }
+            segs_[i] = 0;
+        }
+        if (!map_segment(dev, va + (uint64_t) i * (uint64_t) seg_, (size_t) seg_size_[i], segs_[i])) {
+            (void) hipGetLastError();
+            err = "the driver has no VRAM for another expert-cache segment";
+            live_slots_ = slots_within(mapped_bytes());
+            return false;
+        }
+        at += seg_size_[i];
+        ++mapped_segs_;
+    }
+    live_slots_ = slots_within(mapped_bytes());
+    return true;
 #else
     const Vmm& v = vmm();
     int dev = 0;

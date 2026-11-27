@@ -18,11 +18,6 @@
 
 namespace strata::kernels {
 
-bool rdna_gr_enabled();
-void rdna_gr_read_multi(const FusedGrArgs* a, int n_tok, float* scratch, void* stream,
-                        unsigned long long* sb = nullptr, int si = 0);
-void rdna_gr_init();
-
 #if defined(__HIP_PLATFORM_AMD__) && !defined(STRATA_HIP_GFX906)
 namespace {
 

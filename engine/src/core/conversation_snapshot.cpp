@@ -394,6 +394,8 @@ void parallel_host_memcpy(const std::vector<HostCopySpan>& spans) {
         }
     }
     pool->run(chunks);
+}
+
 /// The exact window (`--kv oct3`) is a CACHE of the K/V, not part of the image: after a restore (or a copy into
 /// another state) its tags must not answer for positions this state's K/V did not write.  One synchronous 4-byte-
 /// per-row memset - the window is ~1.6 MiB in the worst case - and the rows refill as the sequence appends.

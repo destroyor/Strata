@@ -32,13 +32,6 @@
 #include <vector>
 
 namespace strata::kernels {
-bool rdna_gr_enabled();
-void rdna_gr_read_multi(const FusedGrArgs* a, int n_tok, float* scratch, void* stream,
-                        unsigned long long* sb = nullptr, int si = 0);
-void rdna_gr_init();
-}  // namespace strata::kernels
-
-namespace strata::kernels {
 namespace {
 
 constexpr int N = strata::core::kCompiledGeometry.n_embd;         // 2560 in Flash-Next

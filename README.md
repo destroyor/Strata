@@ -1,185 +1,227 @@
-# Strata — RX 7900 XTX Production Fork
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="app/host/public/brand/strata-lockup-dark.svg">
+    <img src="app/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
+  </picture>
+</p>
 
-A performance-tuned fork of [Strata](https://github.com/Niko1221/Strata) for a **single AMD RX 7900 XTX (gfx1100, RDNA3)** box, optimized **quality-first**: every speed change is validated against the baseline with teacher-forced KL / perplexity / top-1 agreement before it ships.
+<h3 align="center">Run powerful AI on your own computer.</h3>
+<p align="center">Chat, code and work with images, locally.</p>
 
-> 中文说明见下半部分 [中文](#strata--rx-7900-xtx-生产分支)。
+<p align="center">
+  <a href="#models">Models</a> · <a href="#install"><b>Install</b></a> ·
+  <a href="#hardware">Hardware</a> · <a href="#tools">Tools</a> ·
+  <a href="#help">Help</a> · <a href="#support-strata">Support</a>
+</p>
 
----
+<p align="center">
+  <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="Download Strata"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT license"></a>
+  <a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor-EA4AAA?logo=githubsponsors&logoColor=fff" alt="Sponsor Strata on GitHub Sponsors"></a>
+  <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Support Strata on Buy Me a Coffee"></a>
+</p>
 
-## What this fork is
+<p align="center"><sub><b>English</b> · <a href="docs/lang/README.zh-CN.md">简体中文</a> · <a href="docs/lang/README.ja.md">日本語</a> · <a href="docs/lang/README.de.md">Deutsch</a> · <a href="docs/lang/README.fr.md">Français</a> · <a href="docs/lang/README.es.md">Español</a> · <a href="docs/lang/README.pt-BR.md">Português</a> · <a href="docs/lang/README.pl.md">Polski</a></sub></p>
 
-This branch (`main`) tracks the **production deployment** exactly. It is the upstream Strata engine plus a small set of measured, quality-gated patches and a documented runtime configuration for one specific machine. It is **not** a general-purpose tuning; the numbers below are for this hardware/model pair and will not transfer unchanged to other setups.
+**Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
 
-- **Engine**: Strata 0.1.57 (HIP build), base `oct3-v0211` (`29cdbca2`) + the patches below.
-- **Production binary sha256**: `1cce3b0dc5b14daa4552dc4809a7a58906a6c3b27602f278a23a0ca21e459aee`.
+## Models
 
-## Hardware / model target
+We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
 
-| Item | Value |
-|---|---|
-| GPU | AMD RX 7900 XTX, 24 GB, gfx1100 (RDNA3, wave32), 960 GB/s |
-| CPU / RAM | Ryzen 9 9950X / 91 GiB |
-| ROCm | 10.3.0 |
-| Model | Swift-Qwen3.8-Flash-Next GSQ-RCO-abliterated **IQ3_S** + Lamina MTP |
-| Context | 262144, **oct3** (3-bit octave) KV |
-| Serve | OpenAI-compatible API, port 8089 |
+<details>
+<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
 
-## Patches in this fork
+| Provider | Choices |
+| --- | --- |
+| **ISTA-DASLab · recommended** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder: IQ1\_M](docs/MODELS.md#coder) for coding. |
+| **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
+| **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF). Lower memory use but slower. |
+| **Other options** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md) |
 
-| Commit | Change | Quality |
-|---|---|---|
-| `5449a12b` | **MMQ ids_identity over-read margin** (cherry-pick `f225844d`): stream-k fixup row table reserves `T*K + roundup(T,J) + J`. Fixes a CUDA Xid 31 FAULT_PDE on layer-split; product values unchanged. | bit-identical |
-| `a7a48f04` | **E18 — oct3 decode batched attention**: route `kv_mode==4` through the batched pre75 gather (`STRATA_ATTN_CHUNK_SEL(4, pre)`), opt-in via `STRATA_ATTN_DAILY=1`. Default off keeps the previous kernel byte-for-byte. | top-1 100%, KL 0 |
+[Compare sizes, memory needs and compatibility](docs/MODELS.md).
 
-## Production runtime configuration
+</details>
 
-Quality-safe optimizations enabled in the systemd user unit (`strata-swift15.service`):
+<details>
+<summary><img src="docs/media/models/hunyuan.svg" width="22" alt="" align="middle"> &nbsp;<b>Tencent Hy4-Flash</b></summary>
 
-```
-STRATA_QSA_ROWS=1        # shuffle-free rows scorer (bit-exact)
-STRATA_ATTN_DAILY=1      # E18 batched oct3 attention (top-1 100%, KL 0)
-STRATA_SH_STREAM=1       # shared expert on its own stream
-STRATA_GDN_SPLIT=1       # GDN step per-head split
-STRATA_LFUSE=1           # shared-expert gate+up single launch
-STRATA_PLE_BATCH=1       # PLE projection batching
-STRATA_ATTN_MERGE_V2=1   # attention merge v2
-STRATA_ROUTE_TAIL_SKIP=0 # OFF — reverted for quality (see below)
-```
+| Pack | Your RAM | Graphics card |
+| --- | --- | --- |
+| **SQ-64** | 64 GiB | 8, 12 or 16 GiB |
+| **SQ-96** | 96 GiB | 8 or 12 GiB |
+| **SQ-128** | 128 GiB | 8 or 12 GiB |
 
-Engine args (key): `--kv oct3 --kv-resident 65536 --spec 4 --spec-min-p 0.2 --ple-io ram --pcie-frac 0 --pool-workers 15 --vram-reserve-mib 576 --conversation-cache-slots 12 --conversation-cache-mib 20480`.
+The number in the name is the RAM the pack is made for.
 
-## Quality validation (quality > speed)
+[Hy4-Flash packs on Hugging Face](https://huggingface.co/strata-engine/Hy4-Flash-Strata)
 
-Validated with `tools/quant_quality.py` — teacher-forced **top-1 agreement + mean/p99 KL + perplexity** over a fixed text set (code / docs / English / multilingual / agent transcript), production-like expert cache (~8000 slots):
+</details>
 
-| Switch | top-1 | mean KL | PPL Δ | Decision |
-|---|---|---|---|---|
-| `ROUTE_TAIL_SKIP=7` | 91.7% | 0.065 | +0.28% | **reverted** (~8% of tokens change argmax; not worth −3.5% speed) |
-| `ATTN_DAILY=1` (E18) | **100%** | **0** | 0 | kept |
-| `QSA_ROWS=1` / combo winners | bit-exact | 0 | 0 | kept |
+<details>
+<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.6-35B-A3B</b></summary>
 
-The deployed configuration produces **bit-identical output to the baseline** (40K generation sha `876459cb4e` matches the unoptimized baseline). Functional tests alone (standard-v1, needle) are **not** treated as proof of quality.
+**Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. These are the currently documented packs for this model.
 
-## Performance
+[Model guide and compatibility](docs/QWEN36.md).
 
-Measured by bracketed A/B on this box (negative = faster), quality-preserving configuration:
+</details>
 
-- **720K context: ≈ −7–8% ms/window** (QSA_ROWS ≈ −5.2%, E18 ≈ −2.9%, plus the combo winners).
-- 160K: ≈ −2–3%; 40K: noise.
+<details>
+<summary><picture><source media="(prefers-color-scheme: dark)" srcset="docs/media/models/thinking-machines-white.png"><img src="docs/media/models/thinking-machines.png" height="22" alt="Thinking Machines" align="middle"></picture> &nbsp;<b>Inkling 2 Mini</b></summary>
 
-## Build / deploy / rollback
+| Provider | Choices |
+| --- | --- |
+| **Strata** | SQ-20 (19.35 GB), SQ-15 (14.35 GB), SQ-10 (10.47 GB) |
+| **Unsloth** | UD-Q8\_K\_XL (22.87 GB), UD-Q4\_K\_XL (17.63 GB), UD-Q4\_K\_M (16.61 GB), UD-IQ4\_XS (15.73 GB), UD-Q3\_K\_XL (13.63 GB), UD-IQ3\_XXS (11.66 GB), UD-Q2\_K\_XL (9.14 GB), UD-IQ2\_XXS (8.49 GB), UD-IQ1\_M (8.02 GB), UD-IQ1\_S (7.76 GB) |
 
-```bash
-# build (HIP, gfx1100)
-cmake -S . -B build-hip -DCMAKE_PREFIX_PATH=/opt/rocm -DCMAKE_BUILD_TYPE=Release
-cmake --build build-hip --target strata
+SQ-20 is made for a 24 GiB graphics card, SQ-15 for 16 GiB and SQ-10 for 12 GiB. A 4 GiB card is enough to start.
 
-# parity gates before deploying
-./build-hip/qsa_parity
-./build-hip/mmq_ids_margin_test
+[Strata packs on Hugging Face](https://huggingface.co/strata-engine/Inkling-2-Mini-Strata) · [Unsloth GGUF files](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)
 
-# deploy: copy build-hip/strata to engine/strata, restart the user unit
-systemctl --user restart strata-swift15
+</details>
 
-# rollback: restore the backed-up binary / unit, restart
-```
+<a id="the-other-sizes"></a>
 
-Backups are kept beside the production binary (`engine/strata.bak-*`) and unit (`strata-swift15.service.bak-*`).
+Not sure what fits? [Choose a model for your computer](docs/MODELS.md#pick-by-memory).
 
-## Branches
+## Install
 
-- `main` — production state (this document).
-- `mmq-fix` — the patch branch `main` was fast-forwarded from.
-- `oct3-v0211` — the production base (`29cdbca2`).
+<a id="option-a-the-strata-app"></a>
 
----
+### Desktop app
 
-# Strata — RX 7900 XTX 生产分支
+**[Download Strata for Windows, Linux or Mac →](https://github.com/Niko1221/Strata/releases/latest)**
 
-[Strata](https://github.com/Niko1221/Strata) 的性能调优分支，面向**单卡 AMD RX 7900 XTX（gfx1100，RDNA3）**，原则是**质量优先**：每一项提速改动都先用 teacher-forced KL / 困惑度 / top-1 一致率对照基线验证，通过才上线。
+Install the app, choose a model, and start chatting. There is one installer for each system. On first start the app
+downloads the engine for your graphics card. [Help with the installer](docs/INSTALL.md#the-app).
 
-## 这个分支是什么
+<sub>Files: `Strata-0.2.22-windows-x64-setup.exe` · `Strata-0.2.22-linux-x86_64.AppImage` · `Strata-0.2.22-macos-arm64.dmg`</sub>
 
-`main` 分支与**生产部署完全一致**：上游 Strata 引擎 + 少量经过实测与质量门禁的补丁 + 针对这台机器的运行配置。它**不是**通用调优，下面的数字只对这套硬件/模型成立，不能原样搬到别的配置。
+<p align="center">
+  <img src="docs/media/app-chat.png" width="900" alt="Strata desktop app with a chat and live code preview side by side">
+  <br><sub>Chat, files and a live preview in one window.</sub>
+</p>
 
-- **引擎**：Strata 0.1.57（HIP 构建），基线 `oct3-v0211`（`29cdbca2`）+ 下述补丁。
-- **生产二进制 sha256**：`1cce3b0dc5b14daa4552dc4809a7a58906a6c3b27602f278a23a0ca21e459aee`。
+<a id="option-b-the-terminal-one-line"></a>
 
-## 硬件 / 模型
+### Terminal app
 
-| 项 | 值 |
-|---|---|
-| GPU | AMD RX 7900 XTX，24 GB，gfx1100（RDNA3，wave32），960 GB/s |
-| CPU / 内存 | Ryzen 9 9950X / 91 GiB |
-| ROCm | 10.3.0 |
-| 模型 | Swift-Qwen3.8-Flash-Next GSQ-RCO-abliterated **IQ3_S** + Lamina MTP |
-| 上下文 | 262144，**oct3**（3-bit octave）KV |
-| 服务 | OpenAI 兼容 API，端口 8089 |
+Prefer the terminal? Install Strata, then run **`strata launch`**.
 
-## 本分支的补丁
+<details open>
+<summary><b>Install commands</b></summary>
 
-| 提交 | 改动 | 质量 |
-|---|---|---|
-| `5449a12b` | **MMQ ids_identity 过读余量**（cherry-pick `f225844d`）：stream-k fixup 行表预留 `T*K + roundup(T,J) + J`。修复层切分下的 CUDA Xid 31 FAULT_PDE；乘积值不变。 | 逐位一致 |
-| `a7a48f04` | **E18 — oct3 解码批量 attention**：把 `kv_mode==4` 走批量 pre75 gather（`STRATA_ATTN_CHUNK_SEL(4, pre)`），`STRATA_ATTN_DAILY=1` opt-in。默认关闭时与原核逐位一致。 | top-1 100%，KL 0 |
+**Linux / Mac**
 
-## 生产运行配置
-
-systemd user unit（`strata-swift15.service`）中启用的质量保全优化：
-
-```
-STRATA_QSA_ROWS=1        # 无 shuffle 的 rows scorer（逐位等价）
-STRATA_ATTN_DAILY=1      # E18 批量 oct3 attention（top-1 100%，KL 0）
-STRATA_SH_STREAM=1       # shared expert 独立流
-STRATA_GDN_SPLIT=1       # GDN step 按 head 切分
-STRATA_LFUSE=1           # shared-expert gate+up 单发射
-STRATA_PLE_BATCH=1       # PLE 投影合批
-STRATA_ATTN_MERGE_V2=1   # attention merge v2
-STRATA_ROUTE_TAIL_SKIP=0 # 关闭——因质量回退（见下）
+```sh
+curl -fsSL --connect-timeout 15 --max-time 120 https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
 ```
 
-关键引擎参数：`--kv oct3 --kv-resident 65536 --spec 4 --spec-min-p 0.2 --ple-io ram --pcie-frac 0 --pool-workers 15 --vram-reserve-mib 576 --conversation-cache-slots 12 --conversation-cache-mib 20480`。
+**Windows PowerShell**
 
-## 质量验证（质量 > 速度）
-
-用 `tools/quant_quality.py` 验证——固定文本集（code / docs / 英文 / 多语言 / agent 转录）上的 teacher-forced **top-1 一致率 + mean/p99 KL + 困惑度**，类生产专家缓存（约 8000 槽）：
-
-| 开关 | top-1 | mean KL | PPL Δ | 判定 |
-|---|---|---|---|---|
-| `ROUTE_TAIL_SKIP=7` | 91.7% | 0.065 | +0.28% | **回退**（约 8% token 改 argmax，不值 −3.5% 提速） |
-| `ATTN_DAILY=1`（E18） | **100%** | **0** | 0 | 保留 |
-| `QSA_ROWS=1` / 组合优胜项 | 逐位 | 0 | 0 | 保留 |
-
-部署配置的输出与基线**逐位一致**（40K 生成 sha `876459cb4e` 与未优化基线相同）。功能测试（standard-v1、needle）通过**不**被视为质量无损的证明。
-
-## 性能
-
-本机括号 A/B 实测（负数=更快），质量保全配置：
-
-- **720K 上下文：约 −7–8% ms/窗口**（QSA_ROWS ≈ −5.2%，E18 ≈ −2.9%，加组合优胜项）。
-- 160K：约 −2–3%；40K：噪声内。
-
-## 构建 / 部署 / 回滚
-
-```bash
-# 构建（HIP，gfx1100）
-cmake -S . -B build-hip -DCMAKE_PREFIX_PATH=/opt/rocm -DCMAKE_BUILD_TYPE=Release
-cmake --build build-hip --target strata
-
-# 部署前 parity 门禁
-./build-hip/qsa_parity
-./build-hip/mmq_ids_margin_test
-
-# 部署：把 build-hip/strata 拷到 engine/strata，重启 user unit
-systemctl --user restart strata-swift15
-
-# 回滚：恢复备份的二进制 / unit，重启
+```powershell
+irm -TimeoutSec 120 https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
 ```
 
-备份保留在生产二进制旁（`engine/strata.bak-*`）与 unit（`strata-swift15.service.bak-*`）。
+On Windows, open a new terminal afterwards. Then:
 
-## 分支
+```sh
+strata launch
+```
 
-- `main` — 生产状态（本文档）。
-- `mmq-fix` — `main` 快进来源的补丁分支。
-- `oct3-v0211` — 生产基线（`29cdbca2`）。
+Follow the prompts to download and start a model. [Terminal guide](docs/TERMINAL_LAUNCH.md).
+
+</details>
+
+<p align="center">
+  <img src="docs/media/terminal-monitor.png" width="900" alt="Strata terminal app showing model activity, speed, memory and recent requests">
+  <br><sub>Watch your model and hardware while it runs.</sub>
+</p>
+
+<a id="build-from-source"></a>
+
+[Build from source](docs/SOURCE_INSTALL.md) · [Docker](docs/DOCKER.md) · [Full install guide](docs/INSTALL.md)
+
+<a id="what-you-need"></a>
+
+## Hardware
+
+| Supported hardware | Guide |
+| --- | --- |
+| **NVIDIA GeForce RTX 20 / 30 / 40 / 50 series** | [NVIDIA setup](docs/INSTALL.md#what-you-need) |
+| **AMD Radeon RX 7700 / 7800 / 7900, RX 9060 / 9070, AI PRO R9700** | [AMD setup](docs/AMD_HIP.md) |
+| **AMD Radeon RX 6800 / 6900 · experimental** | [RX 6000 setup](docs/AMD_HIP.md#rdna2-gfx1030) |
+| **Intel Arc · Linux** | [Intel setup](docs/INTEL_ARC.md) |
+| **Apple Silicon · M1 or newer** | [Mac setup](docs/MAC.md) |
+| **AMD Ryzen AI Max · Strix Halo** | [Strix Halo setup](docs/STRIX_HALO.md) |
+| **NVIDIA DGX Spark · Linux** | [DGX Spark setup](docs/DGX_SPARK_LINUX.md) |
+
+<a id="using-it"></a>
+
+## Tools
+
+**Claude Code · Codex CLI · OpenCode · oh-my-pi · pi.dev · Hermes Agent · OpenClaw**, and more through the OpenAI- and Anthropic-compatible APIs.
+
+Run **`strata connect`** to see setup instructions for your tool. [Connection guide](docs/TERMINAL_LAUNCH.md#connect-your-apps-strata-connect).
+
+<a id="guides"></a>
+<a id="how-fast-is-it"></a>
+<a id="how-does-it-work"></a>
+<a id="something-went-wrong"></a>
+
+## Help
+
+[All guides](docs) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Report a bug](https://github.com/Niko1221/Strata/issues/new/choose) ·
+[Benchmarks](docs/COMMUNITY_BENCHMARKS.md) · [How it works](docs/HOW_IT_WORKS.md) · [Contribute](.github/CONTRIBUTING.md)
+
+## Sponsors of Strata
+
+<!-- Sponsor logos: one centred row with room for five, each 130 px wide. Add the next sponsor after Olares, with &nbsp;&nbsp;&nbsp;&nbsp; between two logos. -->
+<p align="center">
+  <a href="https://heylinger.com"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/media/sponsors/linger-logo-white.svg"><img src="docs/media/sponsors/linger-logo-color.svg" alt="Linger" title="Linger" width="130" align="middle"></picture></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.olares.com/one"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/media/sponsors/olares-logo-white.svg"><img src="docs/media/sponsors/olares-logo-color.svg" alt="Olares" title="Olares" width="130" align="middle"></picture></a>
+</p>
+
+## Support Strata
+
+**Help keep local AI open to everyone.** A GitHub sponsorship or a coffee helps fund development and testing on more hardware.
+
+<a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="GitHub Sponsors: sponsor Strata" height="48"></a>
+<a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee: support Strata" height="48"></a>
+
+### Loyal supporters
+
+Thank you to everyone who supports Strata.
+
+<!-- supporters:start (generated from the public GitHub sponsors: one row per level, the biggest supporters first and largest; private sponsors are not listed) -->
+<a href="https://github.com/codeconduit-official"><img src="https://images.weserv.nl/?url=github.com/codeconduit-official.png&w=240&h=240&fit=cover&mask=circle&output=png" width="120" height="120" alt="codeconduit-official" title="codeconduit-official"></a>
+
+<a href="https://github.com/kod88vn"><img src="https://images.weserv.nl/?url=github.com/kod88vn.png&w=160&h=160&fit=cover&mask=circle&output=png" width="80" height="80" alt="kod88vn" title="kod88vn"></a>
+<a href="https://github.com/router0mail"><img src="https://images.weserv.nl/?url=github.com/router0mail.png&w=160&h=160&fit=cover&mask=circle&output=png" width="80" height="80" alt="router0mail" title="router0mail"></a>
+<a href="https://github.com/kingdonb"><img src="https://images.weserv.nl/?url=github.com/kingdonb.png&w=160&h=160&fit=cover&mask=circle&output=png" width="80" height="80" alt="kingdonb" title="kingdonb"></a>
+<a href="https://github.com/Daisame"><img src="https://images.weserv.nl/?url=github.com/Daisame.png&w=160&h=160&fit=cover&mask=circle&output=png" width="80" height="80" alt="Daisame" title="Daisame"></a>
+
+<a href="https://github.com/ryan4yin"><img src="https://images.weserv.nl/?url=github.com/ryan4yin.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="ryan4yin" title="ryan4yin"></a>
+<a href="https://github.com/themactep"><img src="https://images.weserv.nl/?url=github.com/themactep.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="themactep" title="themactep"></a>
+<a href="https://github.com/macintog"><img src="https://images.weserv.nl/?url=github.com/macintog.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="macintog" title="macintog"></a>
+<a href="https://github.com/bisonbet"><img src="https://images.weserv.nl/?url=github.com/bisonbet.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="bisonbet" title="bisonbet"></a>
+<a href="https://github.com/vizv"><img src="https://images.weserv.nl/?url=github.com/vizv.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="vizv" title="vizv"></a>
+<a href="https://github.com/seoulworker"><img src="https://images.weserv.nl/?url=github.com/seoulworker.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="seoulworker" title="seoulworker"></a>
+<a href="https://github.com/jaceknoga"><img src="https://images.weserv.nl/?url=github.com/jaceknoga.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="jaceknoga" title="jaceknoga"></a>
+<a href="https://github.com/jackyini"><img src="https://images.weserv.nl/?url=github.com/jackyini.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="jackyini" title="jackyini"></a>
+<a href="https://github.com/moruku36"><img src="https://images.weserv.nl/?url=github.com/moruku36.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="moruku36" title="moruku36"></a>
+<a href="https://github.com/hrkgk"><img src="https://images.weserv.nl/?url=github.com/hrkgk.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="hrkgk" title="hrkgk"></a>
+<!-- supporters:end -->
+
+All supporters and how to support Strata: [SUPPORTERS.md](SUPPORTERS.md)
+
+[MIT license](LICENSE) · [Credits and model licenses](docs/HOW_IT_WORKS.md#credits) · [Privacy](docs/SAFETY.md)
+
+<a id="option-c-let-your-ai-set-it-up"></a>
+
+<sub>For AI tools and automated readers: <a href="AGENTS.md">technical reference</a> · <a href="docs/AI_SETUP.md">setup instructions</a>.</sub>
+
+**Sponsorships, hardware partnerships or collaborations:** [niko.veit@outlook.com](mailto:niko.veit@outlook.com).
+

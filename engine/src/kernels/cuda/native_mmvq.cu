@@ -1385,6 +1385,22 @@ int dev_class() {   // 1 = gfx12, 2 = sm_86, 3 = sm_120, 0 = the rest; per devic
     }
     return cls[dev] - 1;
 }
+bool q8_0_rows1_gfx1100() {
+    static const bool v = [] {
+#if defined(__HIPCC__)
+        int dev = 0;
+        cudaDeviceProp p;
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;
+        return strata::kernels::gfx_arch_is(p.gcnArchName, "gfx1100") ||
+               strata::kernels::gfx_arch_is(p.gcnArchName, "gfx1101") ||
+               strata::kernels::gfx_arch_is(p.gcnArchName, "gfx1102");
+#else
+        return false;
+#endif
+    }();
+    return v;
+}
+
 template<typename F>
 bool q8_0_rows1(int n_in, int n_out) {
     if constexpr (!std::is_same_v<F, SmallTraits<Q80Block, 8>>) {
@@ -1396,6 +1412,8 @@ bool q8_0_rows1(int n_in, int n_out) {
             return v == nullptr || v[0] == '\0' ? -1 : v[0] != '0';
         }();
         if (env == 0) return false;
+        // gfx1100: one row wins below the head's 248320-output shape.
+        if (q8_0_rows1_gfx1100() && n_out <= 65536) return true;
         const int c = dev_class();
         static const bool sm120_rows1 = [] {   // BW-6a: opt-in until the engine A/B is read
             const char* v = std::getenv("STRATA_Q80_ROWS1");

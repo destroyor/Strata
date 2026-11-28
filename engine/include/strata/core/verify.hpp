@@ -435,7 +435,7 @@ public:
     /// It gets this verifier's stream; false (with the message in `err`) fails the launch.
     void set_pre_launch(std::function<bool(cudaStream_t cs, std::string& err)> f) { pre_launch_ = std::move(f); }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
-    void set_no_pcie_share(bool on) { no_pcie_share_ = on; }
+    void set_no_pcie_share(bool on) { no_pcie_share_ = on; sink_.pcie_share = !on; }
     bool device_hits_active() const {
         return device_hits_ && no_pcie_share_ && !ar_on() && !always_publish_ && remote_opt_ == nullptr &&
                adapt_gate_ == nullptr && m_bal_ == nullptr;
